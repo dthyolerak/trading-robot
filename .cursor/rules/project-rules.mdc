@@ -1,0 +1,13 @@
+---
+alwaysApply: true
+---
+- Strategy: Mean reversion using 20 EMA + Bollinger Band with RSI(14) confirmation.
+- Pairs: EUR/USD, USD/JPY.
+- Account: minimum $10, micro-lot compatible.
+- Risk: 0.5% per trade, SL=8 pips, TP=12 pips.
+- Daily loss limit: 3%, max drawdown 15%.
+- Backtest using 2 years of M5 data (2019–2024) with realistic spreads and slippage.
+- Generate performance report (CSV + chart).
+- No martingale or averaging.
+- Modular OOP structure, fully commented.
+- Include config file, README, and risk disclaimer.
