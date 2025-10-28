@@ -16,7 +16,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, timedelta
 import yfinance as yf
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+    print("WARNING: MetaTrader5 not available - will use alternative data sources")
 import json
 import os
 from typing import Dict, List, Tuple, Optional
@@ -102,20 +107,21 @@ class ForexBacktester:
         Returns:
             DataFrame with OHLCV data
         """
-        try:
-            # Try MetaTrader 5 first
-            if mt5.initialize():
-                rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M5, 
-                                           datetime.strptime(start_date, '%Y-%m-%d'),
-                                           datetime.strptime(end_date, '%Y-%m-%d'))
-                if rates is not None:
-                    df = pd.DataFrame(rates)
-                    df['time'] = pd.to_datetime(df['time'], unit='s')
-                    df.set_index('time', inplace=True)
-                    mt5.shutdown()
-                    return df
-        except Exception as e:
-            print(f"MetaTrader 5 data unavailable: {e}")
+        # Try MetaTrader 5 first if available
+        if MT5_AVAILABLE:
+            try:
+                if mt5.initialize():
+                    rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M5, 
+                                               datetime.strptime(start_date, '%Y-%m-%d'),
+                                               datetime.strptime(end_date, '%Y-%m-%d'))
+                    if rates is not None:
+                        df = pd.DataFrame(rates)
+                        df['time'] = pd.to_datetime(df['time'], unit='s')
+                        df.set_index('time', inplace=True)
+                        mt5.shutdown()
+                        return df
+            except Exception as e:
+                print(f"MetaTrader 5 data unavailable: {e}")
         
         # Fallback to Yahoo Finance
         try:

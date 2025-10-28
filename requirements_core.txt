@@ -1,0 +1,22 @@
+# Forex Trading Robot - Core Dependencies (Python 3.14 Compatible)
+# =================================================================
+
+# Core data analysis and manipulation
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Data visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Financial data
+yfinance>=0.2.0
+
+# Scientific computing
+scipy>=1.11.0
+
+# Configuration and utilities
+configparser>=5.3.0
+
+# Note: MetaTrader5 will be installed separately if needed
+# The system will work with Yahoo Finance data as fallback
