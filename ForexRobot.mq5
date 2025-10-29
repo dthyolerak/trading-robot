@@ -35,8 +35,8 @@ input int      InpTakeProfitPips = 12;            // Take profit (pips)
 input double   InpMinProfitRatio = 1.2;           // Minimum profit ratio
 
 input group "=== TRADING PAIRS ==="
-input string   InpTradingPairs = "EURUSD,USDJPY,GBPUSD,AUDUSD"; // Trading pairs
-input string   InpPrimaryPair = "EURUSD";         // Primary pair
+input string   InpTradingPairs = "EURUSDm,USDJPYm,GBPUSDm,AUDUSDm,XAUUSDm"; // Trading pairs
+input string   InpPrimaryPair = "EURUSDm";         // Primary pair
 input int      InpMaxPairsSimultaneous = 2;       // Max pairs simultaneous
 
 input group "=== STRATEGY PARAMETERS ==="
