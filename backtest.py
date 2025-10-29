@@ -94,7 +94,22 @@ class ForexBacktester:
             
         return config
     
-    def get_historical_data(self, symbol: str, start_date: str, end_date: str, timeframe: str = '5m') -> pd.DataFrame:
+    def convert_to_yahoo_symbol(self, symbol: str) -> str:
+        """
+        Convert forex symbol to Yahoo Finance format.
+        
+        Args:
+            symbol: Forex symbol (e.g., 'EURUSD')
+            
+        Returns:
+            Yahoo Finance symbol (e.g., 'EURUSD=X')
+        """
+        # Add =X suffix for forex pairs
+        if not symbol.endswith('=X'):
+            return f"{symbol}=X"
+        return symbol
+    
+    def get_historical_data(self, symbol: str, start_date: str, end_date: str, timeframe: str = '1d') -> pd.DataFrame:
         """
         Get historical data for backtesting.
         
@@ -102,7 +117,7 @@ class ForexBacktester:
             symbol: Trading symbol (e.g., 'EURUSD=X')
             start_date: Start date in 'YYYY-MM-DD' format
             end_date: End date in 'YYYY-MM-DD' format
-            timeframe: Data timeframe ('1m', '5m', '1h', '1d')
+            timeframe: Data timeframe ('1d', '1h', '5m')
             
         Returns:
             DataFrame with OHLCV data
@@ -130,6 +145,7 @@ class ForexBacktester:
             if df.empty:
                 print(f"No data available for {symbol}")
                 return pd.DataFrame()
+            print(f"Downloaded {len(df)} records for {symbol}")
             return df
         except Exception as e:
             print(f"Error fetching data for {symbol}: {e}")
@@ -186,22 +202,22 @@ class ForexBacktester:
         df['Buy_Signal'] = 0
         df['Sell_Signal'] = 0
         
-        # Buy signal conditions
+        # Buy signal conditions (more lenient for daily data)
         buy_condition = (
             (df['Close'] > df['EMA_20']) &  # Price above fast EMA
             (df['Close'] > df['EMA_200']) &  # Price above slow EMA
             (df['EMA_20'] > df['EMA_200']) &  # Fast EMA above slow EMA
-            (df['BB_Position'] < 0.3) &  # Price near lower Bollinger Band
-            (df['RSI'] < 70)  # RSI not overbought
+            (df['BB_Position'] < 0.5) &  # Price near lower Bollinger Band (even more lenient)
+            (df['RSI'] < 80)  # RSI not overbought (even more lenient)
         )
         
-        # Sell signal conditions
+        # Sell signal conditions (more lenient for daily data)
         sell_condition = (
             (df['Close'] < df['EMA_20']) &  # Price below fast EMA
             (df['Close'] < df['EMA_200']) &  # Price below slow EMA
             (df['EMA_20'] < df['EMA_200']) &  # Fast EMA below slow EMA
-            (df['BB_Position'] > 0.7) &  # Price near upper Bollinger Band
-            (df['RSI'] > 30)  # RSI not oversold
+            (df['BB_Position'] > 0.5) &  # Price near upper Bollinger Band (even more lenient)
+            (df['RSI'] > 20)  # RSI not oversold (even more lenient)
         )
         
         df.loc[buy_condition, 'Buy_Signal'] = 1
@@ -461,10 +477,14 @@ class ForexBacktester:
         for symbol in self.trading_pairs:
             print(f"\nProcessing {symbol}...")
             
+            # Convert symbol to Yahoo Finance format
+            yahoo_symbol = self.convert_to_yahoo_symbol(symbol)
+            print(f"Using Yahoo symbol: {yahoo_symbol}")
+            
             # Get historical data
-            df = self.get_historical_data(symbol, start_date, end_date)
+            df = self.get_historical_data(yahoo_symbol, start_date, end_date)
             if df.empty:
-                print(f"No data available for {symbol}")
+                print(f"No data available for {symbol} ({yahoo_symbol})")
                 continue
             
             # Calculate indicators
@@ -474,7 +494,7 @@ class ForexBacktester:
             df = self.generate_signals(df)
             
             # Simulate trades
-            trades = self.simulate_trades(df, symbol)
+            trades = self.simulate_trades(df, symbol)  # Use original symbol name
             all_trades.extend(trades)
             
             # Calculate metrics for this pair
@@ -667,13 +687,13 @@ class ForexBacktester:
         print(f"Actual Return: {total_return:.2f}%")
         
         if total_return >= self.day1_target:
-            print("✅ EXCEEDED Day 1 target!")
+            print("SUCCESS: EXCEEDED Day 1 target!")
         elif total_return >= self.day2_target:
-            print("✅ EXCEEDED Day 2 target!")
+            print("SUCCESS: EXCEEDED Day 2 target!")
         elif total_return >= self.day3_plus_min:
-            print("✅ Met Day 3+ minimum target!")
+            print("SUCCESS: Met Day 3+ minimum target!")
         else:
-            print("❌ Did not meet minimum targets")
+            print("WARNING: Did not meet minimum targets")
 
 
 def main():

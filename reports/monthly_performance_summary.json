@@ -1,0 +1,12 @@
+{
+  "total_months": 13,
+  "winning_months": "8",
+  "losing_months": "5",
+  "win_rate_months": 61.53846153846154,
+  "avg_monthly_pnl": 110.94076923076923,
+  "std_monthly_pnl": 301.09329878686935,
+  "best_month": 701.0,
+  "worst_month": -278.64,
+  "avg_trades_per_month": 3.1538461538461537,
+  "max_trades_per_month": "6"
+}

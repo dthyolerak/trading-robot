@@ -1,0 +1,54 @@
+
+            FOREX TRADING RISK DISCLAIMER
+            
+            IMPORTANT: This Forex trading robot is provided for educational and research purposes only. 
+            Forex trading involves substantial risk of loss and is not suitable for all investors.
+            
+            RISK WARNINGS:
+            
+            1. HIGH RISK INVESTMENT: Forex trading carries a high level of risk and may not be suitable for all investors.
+            
+            2. PAST PERFORMANCE: Past performance does not guarantee future results. Historical backtesting results 
+               are not indicative of future performance.
+            
+            3. CAPITAL LOSS: You may lose some or all of your invested capital, therefore you should not speculate 
+               with capital that you cannot afford to lose.
+            
+            4. LEVERAGE RISK: Forex trading involves leverage, which can work both for and against you.
+            
+            5. MARKET VOLATILITY: Forex markets are highly volatile and can move against your position quickly.
+            
+            6. TECHNICAL RISKS: Technical failures, internet connectivity issues, and broker problems can affect trading.
+            
+            7. REGULATORY RISKS: Forex trading regulations vary by jurisdiction and may change.
+            
+            RECOMMENDATIONS:
+            
+            1. Start with demo accounts and paper trading
+            2. Never risk more than you can afford to lose
+            3. Understand all risks before trading live
+            4. Monitor performance regularly
+            5. Have proper risk management in place
+            6. Consult with financial advisors if needed
+            7. Keep detailed records of all trades
+            
+            NO GUARANTEES:
+            
+            This trading robot makes no guarantees about:
+            - Future profitability
+            - Risk of loss
+            - Market conditions
+            - Broker performance
+            - System reliability
+            
+            USE AT YOUR OWN RISK:
+            
+            By using this trading robot, you acknowledge that you understand the risks involved 
+            and agree to use it at your own risk. The developers and distributors of this software 
+            are not responsible for any financial losses incurred.
+            
+            LEGAL NOTICE:
+            
+            This software is provided "as is" without warranty of any kind. The user assumes all 
+            responsibility for the use of this software and any resulting financial outcomes.
+            

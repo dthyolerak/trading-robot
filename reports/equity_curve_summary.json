@@ -1,0 +1,12 @@
+{
+  "initial_balance": 10.0,
+  "final_balance": 1452.2325491905212,
+  "total_return": 14422.325491905212,
+  "max_balance": 2177.231023311615,
+  "min_balance": 187.45101451873785,
+  "max_drawdown": -926.618218421936,
+  "max_drawdown_pct": -60.07061685929852,
+  "avg_daily_return": 6.856804396600248,
+  "std_daily_return": 31.286077640297865,
+  "sharpe_ratio": 3.479132046642681
+}

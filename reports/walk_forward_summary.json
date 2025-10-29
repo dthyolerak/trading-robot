@@ -1,0 +1,11 @@
+{
+  "total_periods": 7,
+  "avg_trades_per_period": 27.428571428571427,
+  "avg_return_per_period": 11078.974178859165,
+  "std_return_per_period": 3364.804105523752,
+  "avg_win_rate": 61.00665435640805,
+  "avg_profit_factor": 2.1561159528352336,
+  "avg_max_drawdown": 740.6727586473737,
+  "profitable_periods": 7,
+  "profitable_period_rate": 100.0
+}

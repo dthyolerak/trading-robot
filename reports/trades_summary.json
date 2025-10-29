@@ -1,0 +1,11 @@
+{
+  "total_trades": 41,
+  "winning_trades": 25,
+  "losing_trades": 16,
+  "avg_trade_duration_hours": 42.73170731707317,
+  "avg_winning_trade": 146.11363410949707,
+  "avg_losing_trade": -138.1630189716816,
+  "largest_win": 527.0004272460938,
+  "largest_loss": -692.0013427734375,
+  "avg_return_per_trade": 351.76403638793204
+}

@@ -16,6 +16,7 @@ import argparse
 from datetime import datetime, timedelta
 import json
 import warnings
+import pandas as pd
 warnings.filterwarnings('ignore')
 
 # Import our custom modules
@@ -60,47 +61,47 @@ def main():
     # Run backtesting
     backtest_results = None
     if not args.skip_backtest:
-        print("\n🔄 Running Backtesting...")
+        print("\nRunning Backtesting...")
         backtest_results = backtester.run_backtest(args.start_date, args.end_date)
         
         if backtest_results and backtest_results.get('all_trades'):
-            print(f"✅ Backtesting completed: {len(backtest_results['all_trades'])} trades generated")
+            print(f"OK: Backtesting completed: {len(backtest_results['all_trades'])} trades generated")
         else:
-            print("❌ Backtesting failed or no trades generated")
+            print("ERROR: Backtesting failed or no trades generated")
             return
     else:
-        print("\n⏭️ Skipping backtesting (using existing results)")
+        print("\nSkipping backtesting (using existing results)")
         # Try to load existing results
         backtest_results = load_existing_results(args.output_dir)
         if not backtest_results:
-            print("❌ No existing results found. Please run backtesting first.")
+            print("ERROR: No existing results found. Please run backtesting first.")
             return
     
     # Run Monte Carlo simulation
     monte_carlo_results = None
     if not args.skip_monte_carlo and backtest_results:
-        print("\n🎲 Running Monte Carlo Simulation...")
+        print("\nRunning Monte Carlo Simulation...")
         monte_carlo.simulation_runs = args.monte_carlo_runs
         monte_carlo_results = monte_carlo.run_monte_carlo_simulation(backtest_results['all_trades'])
         
         if monte_carlo_results:
-            print(f"✅ Monte Carlo simulation completed: {args.monte_carlo_runs} runs")
+            print(f"OK: Monte Carlo simulation completed: {args.monte_carlo_runs} runs")
         else:
-            print("❌ Monte Carlo simulation failed")
+            print("ERROR: Monte Carlo simulation failed")
     
     # Run walk-forward analysis
     walk_forward_results = None
     if not args.skip_walk_forward and backtest_results:
-        print("\n📈 Running Walk-Forward Analysis...")
+        print("\nRunning Walk-Forward Analysis...")
         walk_forward_results = monte_carlo.run_walk_forward_analysis(backtest_results['all_trades'])
         
         if walk_forward_results and walk_forward_results.get('period_results'):
-            print(f"✅ Walk-forward analysis completed: {len(walk_forward_results['period_results'])} periods")
+            print(f"OK: Walk-forward analysis completed: {len(walk_forward_results['period_results'])} periods")
         else:
-            print("❌ Walk-forward analysis failed")
+            print("ERROR: Walk-forward analysis failed")
     
     # Generate comprehensive reports
-    print("\n📊 Generating Comprehensive Reports...")
+    print("\nGenerating Comprehensive Reports...")
     reporter.generate_comprehensive_report(
         backtest_results, 
         monte_carlo_results, 
@@ -110,26 +111,26 @@ def main():
     
     # Generate individual component reports
     if backtest_results:
-        print("\n📈 Generating Backtest Reports...")
+        print("\nGenerating Backtest Reports...")
         backtester.generate_report(backtest_results, args.output_dir)
     
     if monte_carlo_results:
-        print("\n🎲 Generating Monte Carlo Reports...")
+        print("\nGenerating Monte Carlo Reports...")
         monte_carlo.generate_monte_carlo_report(monte_carlo_results, args.output_dir)
     
     # Generate demo trading plan
-    print("\n📋 Generating Demo Trading Plan...")
+    print("\nGenerating Demo Trading Plan...")
     generate_demo_plan(backtest_results, args.output_dir)
     
     # Generate risk disclaimer
-    print("\n⚠️ Generating Risk Disclaimer...")
+    print("\nGenerating Risk Disclaimer...")
     generate_risk_disclaimer(args.output_dir)
     
     # Print final summary
     print_final_summary(backtest_results, monte_carlo_results, walk_forward_results)
     
-    print(f"\n🎉 Complete system execution finished!")
-    print(f"📁 All reports saved to: {args.output_dir}/")
+    print(f"\nSUCCESS: Complete system execution finished!")
+    print(f"All reports saved to: {args.output_dir}/")
     print("="*80)
 
 def load_existing_results(output_dir: str) -> dict:
@@ -342,27 +343,27 @@ def print_final_summary(backtest_results: dict, monte_carlo_results: dict, walk_
     # Backtest summary
     if backtest_results and backtest_results.get('overall_metrics'):
         metrics = backtest_results['overall_metrics']
-        print(f"✅ BACKTESTING: {metrics.get('total_trades', 0)} trades, "
+        print(f"OK: BACKTESTING: {metrics.get('total_trades', 0)} trades, "
               f"{metrics.get('win_rate', 0):.1f}% win rate, "
               f"${metrics.get('net_profit', 0):.2f} net profit")
     else:
-        print("❌ BACKTESTING: No results")
+        print("ERROR: BACKTESTING: No results")
     
     # Monte Carlo summary
     if monte_carlo_results and monte_carlo_results.get('statistics'):
         stats = monte_carlo_results['statistics']
-        print(f"✅ MONTE CARLO: {monte_carlo_results.get('simulation_data', pd.DataFrame()).shape[0]} simulations, "
+        print(f"OK: MONTE CARLO: {monte_carlo_results.get('simulation_data', pd.DataFrame()).shape[0]} simulations, "
               f"{stats.get('mean_total_return', 0):.1f}% mean return")
     else:
-        print("❌ MONTE CARLO: No results")
+        print("ERROR: MONTE CARLO: No results")
     
     # Walk-forward summary
     if walk_forward_results and walk_forward_results.get('summary_statistics'):
         wf_stats = walk_forward_results['summary_statistics']
-        print(f"✅ WALK-FORWARD: {wf_stats.get('total_periods', 0)} periods, "
+        print(f"OK: WALK-FORWARD: {wf_stats.get('total_periods', 0)} periods, "
               f"{wf_stats.get('profitable_period_rate', 0):.1f}% profitable periods")
     else:
-        print("❌ WALK-FORWARD: No results")
+        print("ERROR: WALK-FORWARD: No results")
     
     print("="*80)
 

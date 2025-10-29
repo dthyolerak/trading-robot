@@ -129,6 +129,11 @@ int OnInit()
     if(!InitializeIndicators())
     {
         Print("Failed to initialize indicators");
+        Print("Please check:");
+        Print("1. MetaTrader 5 is properly installed");
+        Print("2. Indicators are available in Navigator");
+        Print("3. AutoTrading is enabled");
+        Print("4. Symbol ", InpPrimaryPair, " is available");
         return INIT_FAILED;
     }
     
@@ -265,24 +270,50 @@ bool InitializeIndicators()
 {
     //--- Initialize EMA handles
     g_ema_fast_handle = iMA(InpPrimaryPair, PERIOD_M5, InpEMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
-    g_ema_slow_handle = iMA(InpPrimaryPair, PERIOD_M5, InpEMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
-    
-    //--- Initialize Bollinger Bands handle
-    g_bb_handle = iBands(InpPrimaryPair, PERIOD_M5, InpBBPeriod, 0, InpBBDeviation, PRICE_CLOSE);
-    
-    //--- Initialize RSI handle
-    g_rsi_handle = iRSI(InpPrimaryPair, PERIOD_M5, InpRSIPeriod, PRICE_CLOSE);
-    
-    //--- Check if all handles are valid
-    if(g_ema_fast_handle == INVALID_HANDLE || 
-       g_ema_slow_handle == INVALID_HANDLE || 
-       g_bb_handle == INVALID_HANDLE || 
-       g_rsi_handle == INVALID_HANDLE)
+    if(g_ema_fast_handle == INVALID_HANDLE)
     {
-        Print("Error: Failed to create indicator handles");
+        Print("Error: Cannot create EMA Fast indicator handle. Error: ", GetLastError());
         return false;
     }
     
+    g_ema_slow_handle = iMA(InpPrimaryPair, PERIOD_M5, InpEMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    if(g_ema_slow_handle == INVALID_HANDLE)
+    {
+        Print("Error: Cannot create EMA Slow indicator handle. Error: ", GetLastError());
+        return false;
+    }
+    
+    //--- Initialize Bollinger Bands handle
+    g_bb_handle = iBands(InpPrimaryPair, PERIOD_M5, InpBBPeriod, 0, InpBBDeviation, PRICE_CLOSE);
+    if(g_bb_handle == INVALID_HANDLE)
+    {
+        Print("Error: Cannot create Bollinger Bands indicator handle. Error: ", GetLastError());
+        return false;
+    }
+    
+    //--- Initialize RSI handle
+    g_rsi_handle = iRSI(InpPrimaryPair, PERIOD_M5, InpRSIPeriod, PRICE_CLOSE);
+    if(g_rsi_handle == INVALID_HANDLE)
+    {
+        Print("Error: Cannot create RSI indicator handle. Error: ", GetLastError());
+        return false;
+    }
+    
+    //--- Wait for indicators to calculate
+    Sleep(1000);
+    
+    //--- Verify indicators are working
+    double test_values[1];
+    if(CopyBuffer(g_ema_fast_handle, 0, 0, 1, test_values) <= 0 ||
+       CopyBuffer(g_ema_slow_handle, 0, 0, 1, test_values) <= 0 ||
+       CopyBuffer(g_bb_handle, 0, 0, 1, test_values) <= 0 ||
+       CopyBuffer(g_rsi_handle, 0, 0, 1, test_values) <= 0)
+    {
+        Print("Error: Indicators created but cannot read data. Error: ", GetLastError());
+        return false;
+    }
+    
+    Print("All indicators initialized successfully");
     return true;
 }
 

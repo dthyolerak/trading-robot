@@ -1,0 +1,22 @@
+{
+  "day1_target": {
+    "target": 900.0,
+    "probability": 81.0
+  },
+  "day2_target": {
+    "target": 200.0,
+    "probability": 82.0
+  },
+  "day3_min_target": {
+    "target": 2.0,
+    "probability": 83.0
+  },
+  "breakeven": {
+    "target": 0.0,
+    "probability": 83.0
+  },
+  "loss": {
+    "target": 0.0,
+    "probability": 17.0
+  }
+}
