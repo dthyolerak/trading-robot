@@ -60,10 +60,17 @@ input int      InpTP_UpdateBars    = 3;              // Bars between TP recalcul
 input group "=== RISK MANAGEMENT ===";
 input double   InpRiskPercent      = 0.5;          // Risk % per trade (lower for M1)
 input double   InpFixedLotSize     = 0.0;           // Fixed lot size (0=use risk%)
+input double   InpFixedRiskDollars  = 0.0;           // Fixed risk in dollars (0=use %)
+input bool     InpVolatilityBasedLot = true;        // Reduce lot size when ATR is high
+input double   InpVolatilityLotAdjust = 0.8;         // Lot multiplier for high volatility (0.8 = 80%)
+input double   InpHighVolATR_Mult   = 1.5;          // ATR multiplier threshold for "high volatility"
 input int      InpMaxOpenTrades    = 1;             // Maximum concurrent trades
-input double   InpDailyLossLimit   = 5.0;           // Daily loss limit (%)
+input double   InpDailyLossLimit   = 5.0;           // Daily loss limit (% of closed balance)
+input double   InpEquityDrawdownLimit = 10.0;        // Max equity drawdown % (live protection)
 input double   InpMaxSpread        = 1.5;           // Maximum spread (pips - tighter for M1)
 input double   InpMaxSlippage      = 2.0;           // Maximum slippage (pips - tighter for M1)
+input bool     InpAdaptiveSlippage = true;          // Increase slippage tolerance during volatility
+input bool     InpWeekendGapProtection = true;      // Close/tighten stops before weekend
 
 input group "=== TRADING HOURS & FILTERS ===";
 input bool     InpTradeHoursEnabled = false;        // Enable hour filter
@@ -92,12 +99,16 @@ int            h_rsi      = INVALID_HANDLE;
 int            h_atr      = INVALID_HANDLE;
 int            h_macd     = INVALID_HANDLE;  // For reversal detection
 int            h_adx      = INVALID_HANDLE;  // For trend strength filter
+int            h_bb       = INVALID_HANDLE;  // Bollinger Bands for reversal confirmation
 
 // Session tracking
 datetime       g_session_start = 0;
 double         g_start_balance = 0.0;
 double         g_daily_balance_start = 0.0;
+double         g_max_equity = 0.0;            // Track max equity for drawdown calculation
 datetime       g_last_bar_time = 0;
+bool           g_broker_checked = false;      // Broker compatibility check flag
+bool           g_broker_compatible = false;   // Broker compatibility result
 
 // Symbol detection
 string         g_active_symbol = "";
@@ -120,6 +131,82 @@ struct TradeState
     datetime last_tp_update_bar;
 };
 TradeState g_trade_states[];
+
+//=========================== BROKER VALIDATION =====================
+bool CheckBrokerCompatibility()
+{
+    if(g_broker_checked) return g_broker_compatible;
+    
+    g_broker_checked = true;
+    string issues = "";
+    
+    // Check hedging mode (needed for multiple positions)
+    ENUM_ACCOUNT_MARGIN_MODE margin_mode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+    if(margin_mode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING && InpMaxOpenTrades > 1)
+    {
+        issues += "Hedging mode not enabled (needed for multiple positions); ";
+    }
+    
+    // Check minimum lot size
+    double min_lot = SymbolInfoDouble(g_active_symbol, SYMBOL_VOLUME_MIN);
+    if(min_lot > 0.01)
+    {
+        issues += StringFormat("Min lot %.2f may be too large for micro accounts; ", min_lot);
+    }
+    
+    // Check stop level
+    int stop_level = (int)SymbolInfoInteger(g_active_symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    if(stop_level > 50) // More than 5 pips for 5-digit broker
+    {
+        issues += StringFormat("Stop level %d points may be too restrictive; ", stop_level);
+    }
+    
+    // Check contract size (micro should be 1000, standard 100000)
+    double contract_size = SymbolInfoDouble(g_active_symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+    if(contract_size == 0)
+    {
+        issues += "Contract size is zero (symbol may not be available); ";
+    }
+    
+    if(issues == "")
+    {
+        g_broker_compatible = true;
+        Print("OK: Broker compatibility check passed");
+        return true;
+    }
+    else
+    {
+        Print("WARNING: Broker compatibility issues detected: ", issues);
+        g_broker_compatible = false;
+        return false;
+    }
+}
+
+//=========================== EQUITY DRAWDOWN CHECK =================
+bool CheckEquityDrawdown()
+{
+    if(InpEquityDrawdownLimit <= 0) return true; // Disabled
+    
+    double current_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    
+    // Track max equity
+    if(current_equity > g_max_equity || g_max_equity == 0)
+        g_max_equity = current_equity;
+    
+    // Calculate drawdown from max equity
+    if(g_max_equity > 0)
+    {
+        double drawdown_pct = ((g_max_equity - current_equity) / g_max_equity) * 100.0;
+        
+        if(drawdown_pct >= InpEquityDrawdownLimit)
+        {
+            Print("STOP: Equity drawdown limit reached: ", drawdown_pct, "% (limit: ", InpEquityDrawdownLimit, "%)");
+            return false; // Stop trading
+        }
+    }
+    
+    return true; // OK to trade
+}
 
 //=========================== UTILITIES =============================
 string DetectEURUSDSymbol()
@@ -243,6 +330,14 @@ bool CreateIndicators()
             Print("ERROR: Failed to create ADX indicator. Error: ", GetLastError());
             return false;
         }
+    }
+    
+    // Bollinger Bands for reversal confirmation
+    h_bb = iBands(g_active_symbol, InpTimeframe, 20, 0, 2, PRICE_CLOSE);
+    if(h_bb == INVALID_HANDLE)
+    {
+        Print("WARNING: Failed to create Bollinger Bands. Reversal detection may be less accurate.");
+        // Don't fail initialization for optional indicator
     }
     
     if(h_ema_fast == INVALID_HANDLE || h_ema_slow == INVALID_HANDLE ||
@@ -385,13 +480,66 @@ double CalculateDynamicTP(ENUM_POSITION_TYPE trade_type, double entry_price)
     return 0.0;
 }
 
+//=========================== SLIPPAGE MANAGEMENT ==================
+double GetAdaptiveSlippagePips()
+{
+    double base_slippage = InpMaxSlippage;
+    
+    if(!InpAdaptiveSlippage) return base_slippage;
+    
+    // Measure recent average spread and ATR volatility
+    double atr_current[], atr_avg[];
+    ArraySetAsSeries(atr_current, true);
+    ArraySetAsSeries(atr_avg, true);
+    ArrayResize(atr_current, 1);
+    ArrayResize(atr_avg, 10);
+    
+    if(CopyBuffer(h_atr, 0, 0, 1, atr_current) >= 1 && 
+       CopyBuffer(h_atr, 0, 0, 10, atr_avg) >= 10)
+    {
+        double atr_sum = 0;
+        for(int i = 0; i < 10; i++) atr_sum += atr_avg[i];
+        double atr_mean = atr_sum / 10.0;
+        
+        // If current ATR is significantly above average, increase slippage tolerance
+        if(atr_current[0] >= atr_mean * 1.3) // 30% above average
+        {
+            base_slippage *= 1.5; // Increase by 50%
+        }
+        else if(atr_current[0] >= atr_mean * 1.1) // 10% above average
+        {
+            base_slippage *= 1.2; // Increase by 20%
+        }
+    }
+    
+    // Also check current spread
+    double spread = (SymbolInfoDouble(g_active_symbol, SYMBOL_ASK) - 
+                     SymbolInfoDouble(g_active_symbol, SYMBOL_BID)) / GetPipValue();
+    if(spread > InpMaxSpread * 1.5)
+    {
+        base_slippage *= 1.3; // Increase slippage during wide spreads
+    }
+    
+    return MathMin(base_slippage, InpMaxSlippage * 2.0); // Cap at 2x base
+}
+
 //=========================== POSITION SIZING =======================
 double CalculateLotSize(double sl_distance_points)
 {
     if(InpFixedLotSize > 0) return InpFixedLotSize;
     
-    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double risk_amount = balance * InpRiskPercent / 100.0;
+    double risk_amount = 0.0;
+    
+    // Fixed dollar risk OR percentage-based
+    if(InpFixedRiskDollars > 0)
+    {
+        risk_amount = InpFixedRiskDollars;
+    }
+    else
+    {
+        double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+        risk_amount = balance * InpRiskPercent / 100.0;
+    }
     
     double tick_value = SymbolInfoDouble(g_active_symbol, SYMBOL_TRADE_TICK_VALUE);
     double tick_size = SymbolInfoDouble(g_active_symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -401,6 +549,30 @@ double CalculateLotSize(double sl_distance_points)
     
     double ticks = sl_distance_points * point / tick_size;
     double lots = risk_amount / (ticks * tick_value);
+    
+    // VOLATILITY-BASED ADJUSTMENT: Reduce lot size when ATR is high
+    if(InpVolatilityBasedLot)
+    {
+        double atr_current[], atr_avg[];
+        ArraySetAsSeries(atr_current, true);
+        ArraySetAsSeries(atr_avg, true);
+        ArrayResize(atr_current, 1);
+        ArrayResize(atr_avg, 20);
+        
+        if(CopyBuffer(h_atr, 0, 0, 1, atr_current) >= 1 && 
+           CopyBuffer(h_atr, 0, 0, 20, atr_avg) >= 20)
+        {
+            double atr_sum = 0;
+            for(int i = 0; i < 20; i++) atr_sum += atr_avg[i];
+            double atr_mean = atr_sum / 20.0;
+            
+            // If current ATR is above threshold, reduce lot size
+            if(atr_current[0] >= atr_mean * InpHighVolATR_Mult)
+            {
+                lots *= InpVolatilityLotAdjust; // e.g., 0.8 = reduce by 20%
+            }
+        }
+    }
     
     // Normalize to broker constraints
     double min_lot = SymbolInfoDouble(g_active_symbol, SYMBOL_VOLUME_MIN);
@@ -704,10 +876,38 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
     if(CopyBuffer(h_ema_fast, 0, 0, 3, ema_f) < 3) return rev;
     if(CopyBuffer(h_ema_slow, 0, 0, 3, ema_s) < 3) return rev;
     
-    // Get candle patterns
+    // Get candle patterns and price data
     MqlRates rates[];
     ArraySetAsSeries(rates, true);
-    if(CopyRates(g_active_symbol, InpTimeframe, 0, 3, rates) < 3) return rev;
+    if(CopyRates(g_active_symbol, InpTimeframe, 0, 5, rates) < 5) return rev; // Need more for price action
+    
+    // Get Bollinger Bands (if available)
+    double bb_upper[], bb_lower[], bb_middle[];
+    ArraySetAsSeries(bb_upper, true);
+    ArraySetAsSeries(bb_lower, true);
+    ArraySetAsSeries(bb_middle, true);
+    ArrayResize(bb_upper, 2);
+    ArrayResize(bb_lower, 2);
+    ArrayResize(bb_middle, 2);
+    bool bb_available = false;
+    if(h_bb != INVALID_HANDLE && CopyBuffer(h_bb, 1, 0, 2, bb_upper) >= 2 &&
+       CopyBuffer(h_bb, 2, 0, 2, bb_lower) >= 2 && CopyBuffer(h_bb, 0, 0, 2, bb_middle) >= 2)
+        bb_available = true;
+    
+    // Price action: Check for higher-high/lower-low structures
+    bool price_action_reversal = false;
+    if(trade_type == POSITION_TYPE_BUY)
+    {
+        // Bearish: Check for lower high structure (reversal pattern)
+        if(rates[0].high < rates[2].high && rates[1].high < rates[3].high)
+            price_action_reversal = true;
+    }
+    else
+    {
+        // Bullish: Check for higher low structure (reversal pattern)
+        if(rates[0].low > rates[2].low && rates[1].low > rates[3].low)
+            price_action_reversal = true;
+    }
     
     double score = 0.0;
     string reason_parts = "";
@@ -786,6 +986,24 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
             reason_count++;
             reason_parts += "Doji_at_high";
         }
+        
+        // 6. Bollinger Band bounce from upper band (bearish reversal)
+        if(bb_available && rates[0].high >= bb_upper[0] * 0.999) // Within 0.1% of upper band
+        {
+            score += 0.20;
+            if(reason_count > 0) reason_parts += "+";
+            reason_count++;
+            reason_parts += "BB_bounce_upper";
+        }
+        
+        // 7. Price action: Lower high structure (bearish reversal pattern)
+        if(price_action_reversal)
+        {
+            score += 0.25;
+            if(reason_count > 0) reason_parts += "+";
+            reason_count++;
+            reason_parts += "PA_lower_high";
+        }
     }
     else // POSITION_TYPE_SELL
     {
@@ -860,11 +1078,52 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
             reason_count++;
             reason_parts += "Doji_at_low";
         }
+        
+        // 6. Bollinger Band bounce from lower band (bullish reversal)
+        if(bb_available && rates[0].low <= bb_lower[0] * 1.001) // Within 0.1% of lower band
+        {
+            score += 0.20;
+            if(reason_count > 0) reason_parts += "+";
+            reason_count++;
+            reason_parts += "BB_bounce_lower";
+        }
+        
+        // 7. Price action: Higher low structure (bullish reversal pattern)
+        if(price_action_reversal)
+        {
+            score += 0.25;
+            if(reason_count > 0) reason_parts += "+";
+            reason_count++;
+            reason_parts += "PA_higher_low";
+        }
     }
     
     // Normalize score to 0-1 and apply sensitivity
     score = MathMin(1.0, score);
     double threshold = 0.3 + (InpReversalSensitivity * 0.07); // 0.3 to 1.0 scale
+    
+    // ADAPTIVE SENSITIVITY: Adjust based on ATR volatility
+    // Higher volatility → lower sensitivity (prevent premature exits in volatile trends)
+    double atr_current[], atr_avg[];
+    ArraySetAsSeries(atr_current, true);
+    ArraySetAsSeries(atr_avg, true);
+    ArrayResize(atr_current, 1);
+    ArrayResize(atr_avg, 10);
+    
+    if(CopyBuffer(h_atr, 0, 0, 1, atr_current) >= 1 && 
+       CopyBuffer(h_atr, 0, 0, 10, atr_avg) >= 10)
+    {
+        double atr_sum = 0;
+        for(int i = 0; i < 10; i++) atr_sum += atr_avg[i];
+        double atr_mean = atr_sum / 10.0;
+        
+        // If volatility is high, increase threshold (lower sensitivity = need stronger reversal)
+        if(atr_current[0] >= atr_mean * 1.3)
+            threshold *= 1.15; // 15% higher threshold = less sensitive
+        else if(atr_current[0] >= atr_mean * 1.1)
+            threshold *= 1.08; // 8% higher threshold
+    }
+    
     threshold = MathMin(0.9, threshold); // Cap at 0.9
     
     if(score >= threshold)
@@ -893,18 +1152,21 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
 }
 
 //=========================== TRADE STATE MANAGEMENT ===============
-TradeState* GetTradeState(ulong ticket)
+int GetTradeStateIndex(ulong ticket)
 {
     for(int i = 0; i < ArraySize(g_trade_states); i++)
     {
         if(g_trade_states[i].ticket == ticket)
-            return &g_trade_states[i];
+            return i;
     }
-    return NULL;
+    return -1; // Not found
 }
 
 void AddTradeState(ulong ticket)
 {
+    // Check if already exists
+    if(GetTradeStateIndex(ticket) >= 0) return;
+    
     int size = ArraySize(g_trade_states);
     ArrayResize(g_trade_states, size + 1);
     g_trade_states[size].ticket = ticket;
@@ -914,20 +1176,16 @@ void AddTradeState(ulong ticket)
 
 void RemoveTradeState(ulong ticket)
 {
-    for(int i = 0; i < ArraySize(g_trade_states); i++)
+    int idx = GetTradeStateIndex(ticket);
+    if(idx < 0) return; // Not found
+    
+    // Remove by swapping with last element
+    int last = ArraySize(g_trade_states) - 1;
+    if(idx < last)
     {
-        if(g_trade_states[i].ticket == ticket)
-        {
-            // Remove by swapping with last element
-            int last = ArraySize(g_trade_states) - 1;
-            if(i < last)
-            {
-                g_trade_states[i] = g_trade_states[last];
-            }
-            ArrayResize(g_trade_states, last);
-            break;
-        }
+        g_trade_states[idx] = g_trade_states[last];
     }
+    ArrayResize(g_trade_states, last);
 }
 
 //=========================== EXIT LOGIC ============================
@@ -947,6 +1205,56 @@ void ManageExits()
     ArraySetAsSeries(atr, true);
     ArrayResize(atr, 1);
     if(CopyBuffer(h_atr, 0, 0, 1, atr) < 1) return;
+    
+    // WEEKEND GAP PROTECTION: Close or tighten stops before weekend
+    if(InpWeekendGapProtection)
+    {
+        MqlDateTime dt;
+        TimeToStruct(TimeCurrent(), dt);
+        
+        // Friday after market hours or Sunday (adjust for your broker timezone)
+        // Typical: Friday 20:00+ or Saturday/Sunday
+        if((dt.day_of_week == 5 && dt.hour >= 20) || dt.day_of_week == 0 || dt.day_of_week == 6)
+        {
+            for(int j = PositionsTotal() - 1; j >= 0; j--)
+            {
+                if(!g_pos.SelectByIndex(j)) continue;
+                if(g_pos.Symbol() != g_active_symbol || g_pos.Magic() != InpMagicNumber) continue;
+                
+                ulong w_ticket = g_pos.Ticket();
+                double w_current = (g_pos.PositionType() == POSITION_TYPE_BUY) ?
+                                  SymbolInfoDouble(g_active_symbol, SYMBOL_BID) :
+                                  SymbolInfoDouble(g_active_symbol, SYMBOL_ASK);
+                double w_sl = g_pos.StopLoss();
+                double w_entry = g_pos.PriceOpen();
+                
+                // Tighten stop to breakeven + small buffer or close if profitable
+                double w_profit = g_pos.Profit();
+                if(w_profit > 0)
+                {
+                    // Close profitable trades before weekend
+                    g_trade.PositionClose(w_ticket);
+                    Print("Weekend protection: Closed profitable position ", w_ticket);
+                    RemoveTradeState(w_ticket);
+                }
+                else if(w_sl == 0 || (g_pos.PositionType() == POSITION_TYPE_BUY && w_sl < w_entry) ||
+                        (g_pos.PositionType() == POSITION_TYPE_SELL && w_sl > w_entry))
+                {
+                    // Move to breakeven + small buffer
+                    double w_point = SymbolInfoDouble(g_active_symbol, SYMBOL_POINT);
+                    double w_new_sl = w_entry;
+                    if(g_pos.PositionType() == POSITION_TYPE_BUY)
+                        w_new_sl = w_entry - (w_point * 5); // 5 points below entry
+                    else
+                        w_new_sl = w_entry + (w_point * 5); // 5 points above entry
+                    
+                    g_trade.PositionModify(w_ticket, w_new_sl, g_pos.TakeProfit());
+                    Print("Weekend protection: Moved stop to breakeven for position ", w_ticket);
+                }
+            }
+            return; // Exit after weekend protection
+        }
+    }
     
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -1007,15 +1315,15 @@ void ManageExits()
         }
         
         // Get or create trade state
-        TradeState* state = GetTradeState(ticket);
-        if(state == NULL)
+        int state_idx = GetTradeStateIndex(ticket);
+        if(state_idx < 0)
         {
             AddTradeState(ticket);
-            state = GetTradeState(ticket);
+            state_idx = GetTradeStateIndex(ticket);
         }
         
         // PARTIAL PROFIT TAKING - Close 50% at TP1
-        if(InpUsePartialTP && !state.partial_taken)
+        if(InpUsePartialTP && !g_trade_states[state_idx].partial_taken)
         {
             double profit_points = 0;
             if(type == POSITION_TYPE_BUY)
@@ -1039,7 +1347,7 @@ void ManageExits()
                 {
                     if(g_trade.PositionClosePartial(ticket, partial_volume))
                     {
-                        state.partial_taken = true;
+                        g_trade_states[state_idx].partial_taken = true;
                         Print("Partial TP taken: Closed ", partial_volume, " lots at TP1 (", InpPartialTP_ATR, "x ATR)");
                         LogTrade("PARTIAL_TP", current_price, sl, tp, partial_volume, 
                                 StringFormat("TP1 @ %.1fx ATR", InpPartialTP_ATR));
@@ -1059,13 +1367,13 @@ void ManageExits()
                 current_bar_time = bar_times[0];
             
             bool should_update = false;
-            if(state.last_tp_update_bar == 0)
+            if(g_trade_states[state_idx].last_tp_update_bar == 0)
                 should_update = true; // First update
-            else if(current_bar_time > 0 && state.last_tp_update_bar > 0)
+            else if(current_bar_time > 0 && g_trade_states[state_idx].last_tp_update_bar > 0)
             {
                 // Check if N bars have passed
                 int bars_passed = iBars(g_active_symbol, InpTimeframe) - 
-                                 iBarShift(g_active_symbol, InpTimeframe, state.last_tp_update_bar);
+                                 iBarShift(g_active_symbol, InpTimeframe, g_trade_states[state_idx].last_tp_update_bar);
                 if(bars_passed >= InpTP_UpdateBars)
                     should_update = true;
             }
@@ -1094,13 +1402,13 @@ void ManageExits()
                     
                     if(tp_improved && g_trade.PositionModify(ticket, sl, new_tp))
                     {
-                        state.last_tp_update_bar = current_bar_time;
+                        g_trade_states[state_idx].last_tp_update_bar = current_bar_time;
                         Print("Dynamic TP updated: ", ticket, " new TP=", new_tp);
                     }
                 }
                 else if(current_bar_time > 0)
                 {
-                    state.last_tp_update_bar = current_bar_time; // Update timestamp even if no new TP
+                    g_trade_states[state_idx].last_tp_update_bar = current_bar_time; // Update timestamp even if no new TP
                 }
             }
         }
@@ -1231,7 +1539,7 @@ bool TryEnterLong()
     if(lots <= 0) return false;
     
     g_trade.SetExpertMagicNumber(InpMagicNumber);
-    g_trade.SetDeviationInPoints((int)PipsToPoints(InpMaxSlippage));
+    g_trade.SetDeviationInPoints((int)PipsToPoints(GetAdaptiveSlippagePips()));
     g_trade.SetTypeFilling(ORDER_FILLING_FOK);
     
     if(g_trade.Buy(lots, g_active_symbol, ask, sl, tp, "EURUSDm Long"))
@@ -1299,7 +1607,7 @@ bool TryEnterShort()
     if(lots <= 0) return false;
     
     g_trade.SetExpertMagicNumber(InpMagicNumber);
-    g_trade.SetDeviationInPoints((int)PipsToPoints(InpMaxSlippage));
+    g_trade.SetDeviationInPoints((int)PipsToPoints(GetAdaptiveSlippagePips()));
     g_trade.SetTypeFilling(ORDER_FILLING_FOK);
     
     if(g_trade.Sell(lots, g_active_symbol, bid, sl, tp, "EURUSDm Short"))
@@ -1343,6 +1651,14 @@ void OnTick()
     
     // Safety checks
     if(!InpEnableTrading) return;
+    
+    // EQUITY DRAWDOWN CHECK (live protection)
+    if(!CheckEquityDrawdown())
+    {
+        Print("Trading stopped: Equity drawdown limit reached!");
+        return;
+    }
+    
     if(!IsTradingHours()) return;
     if(!IsValidSpread()) return;
     if(IsNewsWindow()) return;
@@ -1428,6 +1744,17 @@ int OnInit()
             return INIT_FAILED;
         }
     }
+    
+    // BROKER COMPATIBILITY CHECK
+    if(!CheckBrokerCompatibility())
+    {
+        Print("WARNING: Broker compatibility issues detected. Continuing with caution...");
+    }
+    
+    // Initialize equity tracking
+    g_max_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    g_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    g_daily_balance_start = g_start_balance;
     
     Print("========================================");
     Print("EURUSDm Robot Initialized - M1 Optimized");
