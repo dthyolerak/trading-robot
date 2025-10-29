@@ -1,5 +1,5 @@
 {
-  "report_generated": "2025-10-28T21:43:31.523064",
+  "report_generated": "2025-10-29T13:04:22.701035",
   "strategy_name": "Forex Trading Robot - Hybrid Strategy",
   "backtest_period": "2019-2024",
   "initial_balance": 10.0,
@@ -26,14 +26,14 @@
   },
   "target_performance": "EXCEPTIONAL - Exceeded Day 1 target",
   "monte_carlo_results": {
-    "mean_final_balance": 1434.6639814972878,
-    "std_final_balance": 1491.2463820686362,
-    "mean_total_return": 14246.639814972878,
-    "std_total_return": 14912.463820686362,
-    "mean_win_rate": 60.956097560975614,
-    "mean_max_drawdown": 1058.7712607979774,
-    "worst_case_return": -40403.17893028259,
-    "best_case_return": 69647.42660522461
+    "mean_final_balance": 1500.8511741757393,
+    "std_final_balance": 1442.663865796966,
+    "mean_total_return": 14908.511741757393,
+    "std_total_return": 14426.638657969661,
+    "mean_win_rate": 61.25121951219512,
+    "mean_max_drawdown": 1055.5045691728592,
+    "worst_case_return": -29902.29606628418,
+    "best_case_return": 58027.785420417786
   },
   "walk_forward_results": {
     "total_periods": 7,

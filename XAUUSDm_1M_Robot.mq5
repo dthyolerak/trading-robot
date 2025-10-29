@@ -59,7 +59,7 @@ input int    InpRSI_Period             = 14;
 input int    InpMACD_Fast              = 12;
 input int    InpMACD_Slow              = 26;
 input int    InpMACD_Signal            = 9;
-input double InpEntryScoreThreshold    = 0.75;       // 0..1 composite entry threshold (raised for quality)
+input double InpEntryScoreThreshold    = 0.70;       // 0..1 composite entry threshold (balanced for quality/frequency)
 input double InpReversalThreshold      = 0.80;       // reversal score to close (raised to prevent premature exits)
 input int    InpMinBarsBeforeReverse   = 3;          // Minimum bars before checking reversal (let trades breathe)
 input int    InpSignalConfirmationBars = 2;          // Require N consecutive bars with signal before entry
@@ -288,27 +288,49 @@ void ComputeEntryScores(double &score_buy, double &score_sell)
     double trend_up = (close>ema_m1[0]) + (close>ema_m5[0]) + (close>ema_m30[0]);
     double trend_dn = (close<ema_m1[0]) + (close<ema_m5[0]) + (close<ema_m30[0]);
 
-    // Momentum components
-    double macd_up = (macd_main[0]>macd_sig[0]);
-    double macd_dn = (macd_main[0]<macd_sig[0]);
-    double rsi_up  = (rsi[0]>52);
-    double rsi_dn  = (rsi[0]<48);
+    // Momentum components - require stronger signals
+    bool macd_up = (macd_main[0] > macd_sig[0]) && (macd_main[0] > 0);
+    bool macd_dn = (macd_main[0] < macd_sig[0]) && (macd_main[0] < 0);
+    double rsi_strength = 0.0;
+    if(rsi[0] > 60) rsi_strength = (rsi[0] - 50) / 30.0; // Strong bullish
+    else if(rsi[0] < 40) rsi_strength = (50 - rsi[0]) / 30.0; // Strong bearish
+    rsi_strength = MathMin(1.0, MathMax(0.0, rsi_strength));
 
-    // Mean reversion: z-score to bands
+    // Mean reversion: z-score to bands - require stronger extremes
     double z = 0.0;
     if(bb_upper[0]>bb_lower[0])
         z = (close - bb_mid[0]) / (0.5*(bb_upper[0]-bb_lower[0]));
-    double mr_long = (z < -0.8);
-    double mr_short= (z > 0.8);
+    double mr_long = (z < -1.0) ? MathMin(1.0, MathAbs(z)) : 0.0; // Require z < -1.0
+    double mr_short= (z > 1.0) ? MathMin(1.0, z) : 0.0; // Require z > 1.0
+
+    // Trend strength: require at least 2/3 EMAs aligned
+    double trend_strength_up = trend_up / 3.0;
+    double trend_strength_dn = trend_dn / 3.0;
+    bool strong_trend_up = (trend_up >= 2);
+    bool strong_trend_dn = (trend_dn >= 2);
 
     // Volatility gate: avoid ultra-low ATR
     double vol_ok = (atr[0] > 0.5 * PointValue() * InpSL_Points);
+    
+    // Additional filter: price should not be too far from EMA (avoid chasing)
+    double dist_from_ema = MathAbs(close - ema_m1[0]) / ema_m1[0];
+    bool not_overextended = (dist_from_ema < 0.015); // Within 1.5% of EMA (relaxed)
 
-    // Compose (weights can be tuned)
-    double buy_raw  = 0.35*trend_up/3.0 + 0.25*macd_up + 0.15*rsi_up + 0.25*mr_long;
-    double sell_raw = 0.35*trend_dn/3.0 + 0.25*macd_dn + 0.15*rsi_dn + 0.25*mr_short;
+    // Compose with improved weights - prioritize trend + momentum
+    double buy_raw  = 0.30*trend_strength_up + 0.30*(macd_up?1.0:0.0) + 0.20*rsi_strength + 0.20*mr_long;
+    double sell_raw = 0.30*trend_strength_dn + 0.30*(macd_dn?1.0:0.0) + 0.20*rsi_strength + 0.20*mr_short;
+    
+    // Bonus for strong trends
+    if(strong_trend_up && macd_up) buy_raw += 0.10;
+    if(strong_trend_dn && macd_dn) sell_raw += 0.10;
 
-    if(!vol_ok) { buy_raw*=0.3; sell_raw*=0.3; }
+    // Penalize if not meeting requirements
+    if(!vol_ok) { buy_raw*=0.2; sell_raw*=0.2; }
+    if(!not_overextended) { buy_raw*=0.85; sell_raw*=0.85; } // Reduced penalty
+    
+    // Soft penalty for weak trend (encourage but don't block)
+    if(trend_up < 2) buy_raw *= 0.85; // Was 0.7, now more lenient
+    if(trend_dn < 2) sell_raw *= 0.85; // Was 0.7, now more lenient
 
     score_buy  = MathMin(1.0, MathMax(0.0, buy_raw));
     score_sell = MathMin(1.0, MathMax(0.0, sell_raw));
@@ -339,13 +361,23 @@ double ComputeReversalScore(const ENUM_POSITION_TYPE type)
     double score = 0.0;
     if(type==POSITION_TYPE_BUY)
     {
-        score = 0.4*(macd_flip?1.0:0.0) + 0.3*(rsi[0]<48?1.0:0.0) + 0.3*(engulf?1.0:0.0);
+        // Require stronger reversal signals for BUY positions
+        bool rsi_bearish = (rsi[0] < 40); // More extreme
+        score = 0.40*(macd_flip?1.0:0.0) + 0.35*(rsi_bearish?1.0:0.0) + 0.25*(engulf?1.0:0.0);
+        
+        // Bonus penalty if very bearish
+        if(rsi[0] < 35) score += 0.1;
     }
     else
     {
-        score = 0.4*(macd_flip_dn?1.0:0.0) + 0.3*(rsi[0]>52?1.0:0.0) + 0.3*(engulf?1.0:0.0);
+        // Require stronger reversal signals for SELL positions
+        bool rsi_bullish = (rsi[0] > 60); // More extreme
+        score = 0.40*(macd_flip_dn?1.0:0.0) + 0.35*(rsi_bullish?1.0:0.0) + 0.25*(engulf?1.0:0.0);
+        
+        // Bonus penalty if very bullish
+        if(rsi[0] > 65) score += 0.1;
     }
-    return score;
+    return MathMin(1.0, score);
 }
 
 //======================= ENTRY/EXIT =================================
@@ -432,6 +464,15 @@ void TryEntries()
     double sb, ss; 
     ComputeEntryScores(sb, ss);
     
+    // Diagnostic logging (every 5 bars)
+    static int diag_counter = 0;
+    diag_counter++;
+    if(InpDetailedLogs && diag_counter % 5 == 0)
+    {
+        Print(StringFormat("DIAG: BuyScore=%.3f, SellScore=%.3f, Threshold=%.2f, BuyCount=%d, SellCount=%d, OpenPos=%d",
+              sb, ss, InpEntryScoreThreshold, g_buy_signal_count, g_sell_signal_count, RobotPositionsCount()));
+    }
+    
     // Require confirmation across multiple bars
     if(sb >= InpEntryScoreThreshold)
         g_buy_signal_count++;
@@ -447,24 +488,47 @@ void TryEntries()
     bool buy_confirmed = (g_buy_signal_count >= InpSignalConfirmationBars);
     bool sell_confirmed = (g_sell_signal_count >= InpSignalConfirmationBars);
     
-    // Additional quality check: score must be significantly above threshold
-    double quality_threshold = InpEntryScoreThreshold + 0.05; // Require 0.05 above minimum
+    // Check exposure before trying to open
+    bool buy_exposure_ok = ExposureAllowsNewTrade(InpSL_Points, InpRiskPerTradePct);
+    bool sell_exposure_ok = ExposureAllowsNewTrade(InpSL_Points, InpRiskPerTradePct);
     
-    if(buy_confirmed && sb >= quality_threshold && ExposureAllowsNewTrade(InpSL_Points, InpRiskPerTradePct))
+    // Use slightly relaxed quality threshold (0.02 instead of 0.05) for better entry chances
+    double quality_threshold = InpEntryScoreThreshold + 0.02;
+    
+    // Log why trades are rejected
+    if(InpDetailedLogs)
+    {
+        if(buy_confirmed && sb >= quality_threshold && !buy_exposure_ok)
+            Print("DIAG: BUY rejected - exposure limit reached");
+        if(sell_confirmed && ss >= quality_threshold && !sell_exposure_ok)
+            Print("DIAG: SELL rejected - exposure limit reached");
+    }
+    
+    if(buy_confirmed && sb >= quality_threshold && buy_exposure_ok)
     {
         if(OpenTrade(ORDER_TYPE_BUY, InpSL_Points, InpTP_Points, InpRiskPerTradePct))
         {
             g_buy_signal_count = 0; // Reset after entry
+            Print(StringFormat("ENTERED BUY: score=%.3f, confirmed=%d bars", sb, InpSignalConfirmationBars));
             LogEvent("ENTRY_BUY", StringFormat("score=%.3f,confirmed=%d bars", sb, InpSignalConfirmationBars));
+        }
+        else if(InpDetailedLogs)
+        {
+            Print(StringFormat("DIAG: BUY entry failed - retcode=%d", g_trade.ResultRetcode()));
         }
     }
     
-    if(sell_confirmed && ss >= quality_threshold && ExposureAllowsNewTrade(InpSL_Points, InpRiskPerTradePct))
+    if(sell_confirmed && ss >= quality_threshold && sell_exposure_ok)
     {
         if(OpenTrade(ORDER_TYPE_SELL, InpSL_Points, InpTP_Points, InpRiskPerTradePct))
         {
             g_sell_signal_count = 0; // Reset after entry
+            Print(StringFormat("ENTERED SELL: score=%.3f, confirmed=%d bars", ss, InpSignalConfirmationBars));
             LogEvent("ENTRY_SELL", StringFormat("score=%.3f,confirmed=%d bars", ss, InpSignalConfirmationBars));
+        }
+        else if(InpDetailedLogs)
+        {
+            Print(StringFormat("DIAG: SELL entry failed - retcode=%d", g_trade.ResultRetcode()));
         }
     }
 }
@@ -537,7 +601,16 @@ int OnInit()
     if(!CreateIndicators()) return(INIT_FAILED);
 
     LogEvent("INIT", StringFormat("start_balance=%.2f", g_start_balance));
-    Print("XAUUSDm_1M_Robot initialized. StartBalance=", g_start_balance);
+    Print("========================================");
+    Print("XAUUSDm_1M_Robot initialized successfully");
+    Print("Start Balance: $", g_start_balance);
+    Print("Entry Threshold: ", InpEntryScoreThreshold);
+    Print("Signal Confirmation Bars: ", InpSignalConfirmationBars);
+    Print("Risk Per Trade: ", InpRiskPerTradePct, "%");
+    Print("Max Concurrent Trades: ", InpMaxConcurrentTrades);
+    Print("Max Exposure: ", InpMaxAggExposurePct, "%");
+    Print("========================================");
+    Print("Waiting for signals... (Check Experts tab for diagnostic info every 5 bars)");
     return(INIT_SUCCEEDED);
 }
 
