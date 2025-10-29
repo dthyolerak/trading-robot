@@ -21,9 +21,16 @@ input group "=== EMA CROSSOVER STRATEGY ===";
 input int      InpEMA_Fast         = 12;            // Fast EMA period (optimized for M1)
 input int      InpEMA_Slow         = 26;            // Slow EMA period (optimized for M1)
 input int      InpRSI_Period       = 14;            // RSI period
-input double   InpRSI_LongMin      = 50.0;          // RSI minimum for long entry (tighter for accuracy)
-input double   InpRSI_ShortMax     = 50.0;           // RSI maximum for short entry (tighter for accuracy)
+input double   InpRSI_LongMin      = 50.0;          // RSI minimum for long entry (base value)
+input double   InpRSI_ShortMax     = 50.0;           // RSI maximum for short entry (base value)
+input bool     InpAdaptiveRSI      = true;           // Adjust RSI thresholds based on volatility
+input double   InpRSI_VolatilityAdjust = 5.0;        // RSI adjustment per ATR deviation
 input int      InpSignalConfirmation = 2;           // Require N consecutive bars with signal
+input bool     InpUseADXFilter     = true;           // Use ADX to filter choppy markets
+input int      InpADX_Period       = 14;            // ADX period
+input double   InpADX_MinLevel     = 20.0;          // Minimum ADX for trade (trend strength)
+input bool     InpVolumeConfirm    = true;           // Require volume/volatility confirmation
+input int      InpVolumeLookback   = 5;              // Bars to check for volume confirmation
 
 input group "=== ATR-BASED EXIT RULES ===";
 input int      InpATR_Period       = 14;            // ATR period
@@ -43,6 +50,12 @@ input int      InpReversalSensitivity = 6;         // 1-10: Higher = reacts soon
 input int      InpSR_Lookback      = 50;            // Candles to check for S/R levels
 input int      InpWaitAfterCloseMinutes = 5;        // Wait N minutes after reversal close
 input double   InpTP_BufferPips    = 2.0;           // Pips before S/R level for TP
+input bool     InpMTF_ReversalConf = true;          // Multi-timeframe reversal confirmation
+input ENUM_TIMEFRAMES InpMTF_Period = PERIOD_M5;    // Higher TF for reversal confirmation
+input bool     InpUsePartialTP     = true;          // Enable partial profit taking
+input double   InpPartialTP_ATR   = 1.0;            // Close 50% at this ATR multiple
+input bool     InpDynamicTP_Update = true;           // Recalculate TP during trade (every N bars)
+input int      InpTP_UpdateBars    = 3;              // Bars between TP recalculation
 
 input group "=== RISK MANAGEMENT ===";
 input double   InpRiskPercent      = 0.5;          // Risk % per trade (lower for M1)
@@ -78,6 +91,7 @@ int            h_ema_slow = INVALID_HANDLE;
 int            h_rsi      = INVALID_HANDLE;
 int            h_atr      = INVALID_HANDLE;
 int            h_macd     = INVALID_HANDLE;  // For reversal detection
+int            h_adx      = INVALID_HANDLE;  // For trend strength filter
 
 // Session tracking
 datetime       g_session_start = 0;
@@ -97,6 +111,15 @@ int            g_short_signal_count = 0;
 
 // Standby mode (after reversal close)
 datetime       g_standby_until = 0;
+
+// Partial TP and dynamic TP tracking (ticket -> state)
+struct TradeState
+{
+    ulong ticket;
+    bool partial_taken;
+    datetime last_tp_update_bar;
+};
+TradeState g_trade_states[];
 
 //=========================== UTILITIES =============================
 string DetectEURUSDSymbol()
@@ -211,6 +234,16 @@ bool CreateIndicators()
     h_rsi      = iRSI(g_active_symbol, InpTimeframe, InpRSI_Period, PRICE_CLOSE);
     h_atr      = iATR(g_active_symbol, InpTimeframe, InpATR_Period);
     h_macd     = iMACD(g_active_symbol, InpTimeframe, 12, 26, 9, PRICE_CLOSE);
+    
+    if(InpUseADXFilter)
+    {
+        h_adx = iADX(g_active_symbol, InpTimeframe, InpADX_Period);
+        if(h_adx == INVALID_HANDLE)
+        {
+            Print("ERROR: Failed to create ADX indicator. Error: ", GetLastError());
+            return false;
+        }
+    }
     
     if(h_ema_fast == INVALID_HANDLE || h_ema_slow == INVALID_HANDLE ||
        h_rsi == INVALID_HANDLE || h_atr == INVALID_HANDLE || h_macd == INVALID_HANDLE)
@@ -380,6 +413,128 @@ double CalculateLotSize(double sl_distance_points)
     return lots;
 }
 
+//=========================== FILTER FUNCTIONS =======================
+void GetAdaptiveRSIThresholds(double &long_min, double &short_max)
+{
+    long_min = InpRSI_LongMin;
+    short_max = InpRSI_ShortMax;
+    
+    if(!InpAdaptiveRSI) return;
+    
+    // Get current ATR and historical ATR average
+    double atr_current[], atr_avg[];
+    ArraySetAsSeries(atr_current, true);
+    ArraySetAsSeries(atr_avg, true);
+    ArrayResize(atr_current, 1);
+    ArrayResize(atr_avg, 20);
+    
+    if(CopyBuffer(h_atr, 0, 0, 1, atr_current) < 1) return;
+    if(CopyBuffer(h_atr, 0, 0, 20, atr_avg) < 20) return;
+    
+    // Calculate average ATR
+    double atr_sum = 0;
+    for(int i = 0; i < 20; i++) atr_sum += atr_avg[i];
+    double atr_mean = atr_sum / 20.0;
+    
+    // Calculate deviation (higher volatility = relax RSI thresholds)
+    double deviation = (atr_current[0] - atr_mean) / atr_mean; // -1 to +1 typically
+    double adjustment = deviation * InpRSI_VolatilityAdjust;
+    
+    // Adjust thresholds (high volatility = lower long_min, higher short_max)
+    long_min = MathMax(30.0, MathMin(70.0, InpRSI_LongMin - adjustment));
+    short_max = MathMin(70.0, MathMax(30.0, InpRSI_ShortMax + adjustment));
+}
+
+bool CheckADXFilter()
+{
+    if(!InpUseADXFilter) return true;
+    if(h_adx == INVALID_HANDLE) return false;
+    
+    double adx[];
+    ArraySetAsSeries(adx, true);
+    ArrayResize(adx, 1);
+    if(CopyBuffer(h_adx, 0, 0, 1, adx) < 1) return false;
+    
+    return (adx[0] >= InpADX_MinLevel);
+}
+
+bool CheckVolumeConfirmation()
+{
+    if(!InpVolumeConfirm) return true;
+    
+    // Use tick volume or ATR slope as proxy for momentum
+    long tick_volume[];
+    ArraySetAsSeries(tick_volume, true);
+    ArrayResize(tick_volume, InpVolumeLookback + 5);
+    
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    if(CopyRates(g_active_symbol, InpTimeframe, 0, InpVolumeLookback + 5, rates) < InpVolumeLookback + 5)
+        return false;
+    
+    // Option 1: Check increasing volume (if tick volume available)
+    // Option 2: Check ATR slope (volatility expansion = real move)
+    double atr_values[];
+    ArraySetAsSeries(atr_values, true);
+    ArrayResize(atr_values, InpVolumeLookback);
+    if(CopyBuffer(h_atr, 0, 0, InpVolumeLookback, atr_values) < InpVolumeLookback)
+        return false;
+    
+    // ATR increasing = volatility/momentum expanding = real directional move
+    // Compare recent ATR to average
+    double atr_sum = 0;
+    for(int i = 0; i < InpVolumeLookback; i++)
+        atr_sum += atr_values[i];
+    double atr_avg = atr_sum / InpVolumeLookback;
+    
+    // Recent ATR should be above average (momentum confirmation)
+    return (atr_values[0] >= atr_avg * 0.95); // At least 95% of average
+}
+
+bool CheckMTFReversal(ENUM_POSITION_TYPE trade_type)
+{
+    if(!InpMTF_ReversalConf) return true; // If disabled, don't block
+    
+    // Check higher timeframe for reversal confirmation
+    int h_rsi_mtf = iRSI(g_active_symbol, InpMTF_Period, InpRSI_Period, PRICE_CLOSE);
+    int h_ema_f_mtf = iMA(g_active_symbol, InpMTF_Period, InpEMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+    int h_ema_s_mtf = iMA(g_active_symbol, InpMTF_Period, InpEMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+    
+    if(h_rsi_mtf == INVALID_HANDLE || h_ema_f_mtf == INVALID_HANDLE || h_ema_s_mtf == INVALID_HANDLE)
+        return true; // If indicators fail, don't block
+    
+    double rsi_mtf[], ema_f_mtf[], ema_s_mtf[];
+    ArraySetAsSeries(rsi_mtf, true);
+    ArraySetAsSeries(ema_f_mtf, true);
+    ArraySetAsSeries(ema_s_mtf, true);
+    ArrayResize(rsi_mtf, 2);
+    ArrayResize(ema_f_mtf, 2);
+    ArrayResize(ema_s_mtf, 2);
+    
+    if(CopyBuffer(h_rsi_mtf, 0, 0, 2, rsi_mtf) < 2) return true;
+    if(CopyBuffer(h_ema_f_mtf, 0, 0, 2, ema_f_mtf) < 2) return true;
+    if(CopyBuffer(h_ema_s_mtf, 0, 0, 2, ema_s_mtf) < 2) return true;
+    
+    IndicatorRelease(h_rsi_mtf);
+    IndicatorRelease(h_ema_f_mtf);
+    IndicatorRelease(h_ema_s_mtf);
+    
+    if(trade_type == POSITION_TYPE_BUY)
+    {
+        // Bearish reversal on higher TF: RSI overbought or EMA cross down
+        bool rsi_bearish = (rsi_mtf[0] > 70 && rsi_mtf[0] < rsi_mtf[1]);
+        bool ema_bearish = (ema_f_mtf[0] < ema_s_mtf[0] && ema_f_mtf[1] >= ema_s_mtf[1]);
+        return !(rsi_bearish || ema_bearish); // Return true if NO reversal
+    }
+    else
+    {
+        // Bullish reversal on higher TF: RSI oversold or EMA cross up
+        bool rsi_bullish = (rsi_mtf[0] < 30 && rsi_mtf[0] > rsi_mtf[1]);
+        bool ema_bullish = (ema_f_mtf[0] > ema_s_mtf[0] && ema_f_mtf[1] <= ema_s_mtf[1]);
+        return !(rsi_bullish || ema_bullish); // Return true if NO reversal
+    }
+}
+
 //=========================== ENTRY LOGIC ===========================
 bool CheckLongEntry()
 {
@@ -409,8 +564,10 @@ bool CheckLongEntry()
     // Price above Fast EMA
     bool price_above = (close_price > ema_f[0]);
     
-    // RSI filter - require stronger signals for M1
-    bool rsi_ok = (rsi[0] > InpRSI_LongMin && rsi[0] < 70); // Avoid overbought
+    // Adaptive RSI filter
+    double rsi_long_min, rsi_short_max;
+    GetAdaptiveRSIThresholds(rsi_long_min, rsi_short_max);
+    bool rsi_ok = (rsi[0] > rsi_long_min && rsi[0] < 70); // Avoid overbought
     
     // Volatility filter
     bool vol_ok = true;
@@ -419,11 +576,17 @@ bool CheckLongEntry()
         vol_ok = (atr[0] >= InpATR_MinThreshold && atr[0] <= InpATR_MaxThreshold);
     }
     
+    // ADX trend strength filter
+    bool adx_ok = CheckADXFilter();
+    
+    // Volume/volatility confirmation
+    bool volume_ok = CheckVolumeConfirmation();
+    
     // Require both EMA alignment AND price confirmation for better accuracy
     bool ema_aligned = (ema_f[0] > ema_s[0]);
     bool strong_signal = crossover || (price_above && ema_aligned && ema_f[0] > ema_f[1]); // EMA rising
     
-    return strong_signal && rsi_ok && vol_ok;
+    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok;
 }
 
 bool CheckShortEntry()
@@ -454,8 +617,10 @@ bool CheckShortEntry()
     // Price below Fast EMA
     bool price_below = (close_price < ema_f[0]);
     
-    // RSI filter - require stronger signals for M1
-    bool rsi_ok = (rsi[0] < InpRSI_ShortMax && rsi[0] > 30); // Avoid oversold
+    // Adaptive RSI filter
+    double rsi_long_min, rsi_short_max;
+    GetAdaptiveRSIThresholds(rsi_long_min, rsi_short_max);
+    bool rsi_ok = (rsi[0] < rsi_short_max && rsi[0] > 30); // Avoid oversold
     
     // Volatility filter
     bool vol_ok = true;
@@ -464,11 +629,17 @@ bool CheckShortEntry()
         vol_ok = (atr[0] >= InpATR_MinThreshold && atr[0] <= InpATR_MaxThreshold);
     }
     
+    // ADX trend strength filter
+    bool adx_ok = CheckADXFilter();
+    
+    // Volume/volatility confirmation
+    bool volume_ok = CheckVolumeConfirmation();
+    
     // Require both EMA alignment AND price confirmation for better accuracy
     bool ema_aligned = (ema_f[0] < ema_s[0]);
     bool strong_signal = crossover || (price_below && ema_aligned && ema_f[0] < ema_f[1]); // EMA falling
     
-    return strong_signal && rsi_ok && vol_ok;
+    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok;
 }
 
 int CountOpenTrades()
@@ -698,12 +869,65 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
     
     if(score >= threshold)
     {
+        // Multi-timeframe confirmation: Only exit if higher TF also shows reversal
+        if(InpMTF_ReversalConf)
+        {
+            bool mtf_confirms = !CheckMTFReversal(trade_type); // CheckMTFReversal returns true if NO reversal
+            if(!mtf_confirms)
+            {
+                // Higher TF doesn't confirm reversal - reduce score but don't exit
+                score *= 0.7; // Reduce strength by 30%
+                if(score < threshold * 1.2) // Only exit if score is still very high
+                {
+                    return rev; // Don't exit
+                }
+            }
+        }
+        
         rev.detected = true;
         rev.strength = score;
         rev.reason = reason_parts;
     }
     
     return rev;
+}
+
+//=========================== TRADE STATE MANAGEMENT ===============
+TradeState* GetTradeState(ulong ticket)
+{
+    for(int i = 0; i < ArraySize(g_trade_states); i++)
+    {
+        if(g_trade_states[i].ticket == ticket)
+            return &g_trade_states[i];
+    }
+    return NULL;
+}
+
+void AddTradeState(ulong ticket)
+{
+    int size = ArraySize(g_trade_states);
+    ArrayResize(g_trade_states, size + 1);
+    g_trade_states[size].ticket = ticket;
+    g_trade_states[size].partial_taken = false;
+    g_trade_states[size].last_tp_update_bar = 0;
+}
+
+void RemoveTradeState(ulong ticket)
+{
+    for(int i = 0; i < ArraySize(g_trade_states); i++)
+    {
+        if(g_trade_states[i].ticket == ticket)
+        {
+            // Remove by swapping with last element
+            int last = ArraySize(g_trade_states) - 1;
+            if(i < last)
+            {
+                g_trade_states[i] = g_trade_states[last];
+            }
+            ArrayResize(g_trade_states, last);
+            break;
+        }
+    }
 }
 
 //=========================== EXIT LOGIC ============================
@@ -778,7 +1002,107 @@ void ManageExits()
                     }
                 }
             }
+            RemoveTradeState(ticket);
             continue; // Move to next position
+        }
+        
+        // Get or create trade state
+        TradeState* state = GetTradeState(ticket);
+        if(state == NULL)
+        {
+            AddTradeState(ticket);
+            state = GetTradeState(ticket);
+        }
+        
+        // PARTIAL PROFIT TAKING - Close 50% at TP1
+        if(InpUsePartialTP && !state.partial_taken)
+        {
+            double profit_points = 0;
+            if(type == POSITION_TYPE_BUY)
+                profit_points = (current_price - open_price) / point;
+            else
+                profit_points = (open_price - current_price) / point;
+            
+            double tp1_atr_points = atr_points * InpPartialTP_ATR;
+            if(profit_points >= tp1_atr_points)
+            {
+                double current_volume = g_pos.Volume();
+                double partial_volume = NormalizeDouble(current_volume / 2.0, 2);
+                
+                // Ensure partial volume is valid
+                double min_lot = SymbolInfoDouble(g_active_symbol, SYMBOL_VOLUME_MIN);
+                double lot_step = SymbolInfoDouble(g_active_symbol, SYMBOL_VOLUME_STEP);
+                partial_volume = MathFloor(partial_volume / lot_step) * lot_step;
+                partial_volume = MathMax(min_lot, partial_volume);
+                
+                if(partial_volume < current_volume && current_volume - partial_volume >= min_lot)
+                {
+                    if(g_trade.PositionClosePartial(ticket, partial_volume))
+                    {
+                        state.partial_taken = true;
+                        Print("Partial TP taken: Closed ", partial_volume, " lots at TP1 (", InpPartialTP_ATR, "x ATR)");
+                        LogTrade("PARTIAL_TP", current_price, sl, tp, partial_volume, 
+                                StringFormat("TP1 @ %.1fx ATR", InpPartialTP_ATR));
+                    }
+                }
+            }
+        }
+        
+        // DYNAMIC TP UPDATE - Recalculate S/R-based TP during trade
+        if(InpDynamicTP_Update && InpUseDynamicTP)
+        {
+            datetime current_bar_time = 0;
+            datetime bar_times[];
+            ArraySetAsSeries(bar_times, true);
+            ArrayResize(bar_times, 1);
+            if(CopyTime(g_active_symbol, InpTimeframe, 0, 1, bar_times) > 0)
+                current_bar_time = bar_times[0];
+            
+            bool should_update = false;
+            if(state.last_tp_update_bar == 0)
+                should_update = true; // First update
+            else if(current_bar_time > 0 && state.last_tp_update_bar > 0)
+            {
+                // Check if N bars have passed
+                int bars_passed = iBars(g_active_symbol, InpTimeframe) - 
+                                 iBarShift(g_active_symbol, InpTimeframe, state.last_tp_update_bar);
+                if(bars_passed >= InpTP_UpdateBars)
+                    should_update = true;
+            }
+            
+            if(should_update)
+            {
+                double new_tp = CalculateDynamicTP(type, open_price);
+                if(new_tp > 0)
+                {
+                    // Validate new TP is better than current
+                    bool tp_improved = false;
+                    if(type == POSITION_TYPE_BUY)
+                    {
+                        // New TP should be higher and reasonable
+                        if(new_tp > tp && new_tp > current_price + (point * 10) && 
+                           new_tp < current_price + (point * 500))
+                            tp_improved = true;
+                    }
+                    else
+                    {
+                        // New TP should be lower and reasonable
+                        if((tp == 0 || new_tp < tp) && new_tp < current_price - (point * 10) &&
+                           new_tp > current_price - (point * 500))
+                            tp_improved = true;
+                    }
+                    
+                    if(tp_improved && g_trade.PositionModify(ticket, sl, new_tp))
+                    {
+                        state.last_tp_update_bar = current_bar_time;
+                        Print("Dynamic TP updated: ", ticket, " new TP=", new_tp);
+                    }
+                }
+                else if(current_bar_time > 0)
+                {
+                    state.last_tp_update_bar = current_bar_time; // Update timestamp even if no new TP
+                }
+            }
         }
         
         // Time-based exit
@@ -789,6 +1113,7 @@ void ManageExits()
             if(minutes_open >= InpMaxTradeLifeMin)
             {
                 g_trade.PositionClose(ticket);
+                RemoveTradeState(ticket);
                 LogTrade("TIME_EXIT", current_price, sl, tp, g_pos.Volume(), "Max time reached");
                 continue;
             }
@@ -911,6 +1236,16 @@ bool TryEnterLong()
     
     if(g_trade.Buy(lots, g_active_symbol, ask, sl, tp, "EURUSDm Long"))
     {
+        ulong ticket = g_trade.ResultOrder();
+        if(ticket > 0)
+        {
+            // Find the position ticket (deal creates position)
+            Sleep(100); // Brief delay for position to be created
+            if(g_pos.SelectByTicket(ticket) || g_pos.SelectByIndex(PositionsTotal() - 1))
+            {
+                AddTradeState(g_pos.Ticket());
+            }
+        }
         Print("LONG entry: ", lots, " lots @ ", ask, " SL=", sl, " TP=", tp);
         LogTrade("LONG", ask, sl, tp, lots, "EMA crossover + RSI");
         return true;
@@ -969,6 +1304,16 @@ bool TryEnterShort()
     
     if(g_trade.Sell(lots, g_active_symbol, bid, sl, tp, "EURUSDm Short"))
     {
+        ulong ticket = g_trade.ResultOrder();
+        if(ticket > 0)
+        {
+            // Find the position ticket (deal creates position)
+            Sleep(100); // Brief delay for position to be created
+            if(g_pos.SelectByTicket(ticket) || g_pos.SelectByIndex(PositionsTotal() - 1))
+            {
+                AddTradeState(g_pos.Ticket());
+            }
+        }
         Print("SHORT entry: ", lots, " lots @ ", bid, " SL=", sl, " TP=", tp);
         LogTrade("SHORT", bid, sl, tp, lots, "EMA crossover + RSI");
         return true;
