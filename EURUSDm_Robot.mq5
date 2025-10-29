@@ -2508,9 +2508,9 @@ bool PlaceOrderWithRetry(ENUM_ORDER_TYPE type, double lots, double price, double
         else
             ok = g_trade.Sell(lots, g_active_symbol, price, sl, tp, comment);
         if(ok) return true;
-        int rc = g_trade.ResultRetcode();
-        // Retry-worthy retcodes
-        if(rc==TRADE_RETCODE_REQUOTE || rc==TRADE_RETCODE_PRICE_OFF || rc==TRADE_RETCODE_REJECT || rc==TRADE_RETCODE_OFFQUOTES)
+        uint rc = g_trade.ResultRetcode();
+        // Retry-worthy retcodes (market temporarily unavailable or price issues)
+        if(rc==TRADE_RETCODE_REQUOTE || rc==TRADE_RETCODE_PRICE_OFF || rc==TRADE_RETCODE_REJECT)
         {
             attempts++;
             // widen slippage slightly each retry
@@ -2618,9 +2618,17 @@ bool SendTelegram(string message)
     if(StringLen(InpTelegramBotToken)==0 || StringLen(InpTelegramChatId)==0) return false;
     string url = "https://api.telegram.org/bot" + InpTelegramBotToken + "/sendMessage";
     string body = "chat_id=" + InpTelegramChatId + "&text=" + message;
-    char data[]; StringToCharArray(body, data);
-    char result[]; string headers;
-    int code = WebRequest("POST", url, headers, 5000, data, ArraySize(data), result, headers);
+    
+    // Convert to char array for WebRequest
+    char data[];
+    StringToCharArray(body, data, 0, WHOLE_ARRAY, CP_UTF8);
+    
+    char result[];
+    string request_headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+    string response_headers = "";
+    
+    // WebRequest signature: (method, url, headers, timeout, data[], result[], headers_response)
+    int code = WebRequest("POST", url, request_headers, 5000, data, result, response_headers);
     if(code==200) return true;
     Print("Telegram send failed, code=", code);
     return false;
