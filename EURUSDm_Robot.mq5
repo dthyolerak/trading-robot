@@ -52,10 +52,23 @@ input int      InpWaitAfterCloseMinutes = 5;        // Wait N minutes after reve
 input double   InpTP_BufferPips    = 2.0;           // Pips before S/R level for TP
 input bool     InpMTF_ReversalConf = true;          // Multi-timeframe reversal confirmation
 input ENUM_TIMEFRAMES InpMTF_Period = PERIOD_M5;    // Higher TF for reversal confirmation
+input bool     InpReversalMultiConfirm = true;      // Require RSI+MACD+candle pattern together
+input int      InpReversalMinIndicators = 2;        // Min indicator categories needed (RSI/MACD/Candle)
 input bool     InpUsePartialTP     = true;          // Enable partial profit taking
 input double   InpPartialTP_ATR   = 1.0;            // Close 50% at this ATR multiple
 input bool     InpDynamicTP_Update = true;           // Recalculate TP during trade (every N bars)
 input int      InpTP_UpdateBars    = 3;              // Bars between TP recalculation
+input bool     InpUsePivotLevels  = true;            // Use pivot points for dynamic TP
+input bool     InpUseFibLevels    = true;            // Use Fibonacci levels for dynamic TP
+input int      InpPivotLookback    = 20;             // Bars to calculate pivot (high/low/close)
+input bool     InpMTF_EntryConfirm = true;          // Require higher TF confirmation for entries
+input bool     InpBiasUseHigherTF  = true;          // Trade only in direction of higher TF trend
+input int      InpOrderRetryCount  = 3;             // Number of retries on order failure
+input int      InpOrderRetryDelayMs = 250;          // Delay between retries (ms)
+input bool     InpAllowScaleIn     = false;         // Enable scale-in during strong trends
+input int      InpScaleInMaxAdds   = 2;             // Max additional entries
+input double   InpScaleInATRDistance = 1.0;         // Min distance between adds (ATR multiples)
+input double   InpScaleInMinProfitATR = 0.5;        // Require current profit >= this ATR before add
 
 input group "=== RISK MANAGEMENT ===";
 input double   InpRiskPercent      = 0.5;          // Risk % per trade (lower for M1)
@@ -275,7 +288,8 @@ void InitializeLogging()
     if(h != INVALID_HANDLE)
     {
         FileWrite(h, "Time", "Type", "EntryPrice", "SL", "TP", "LotSize", "Reason", 
-                  "Balance", "Equity", "Spread", "ATR", "RSI", "EMA_Fast", "EMA_Slow");
+                  "Balance", "Equity", "Spread", "ATR", "RSI", "EMA_Fast", "EMA_Slow",
+                  "Risk_Points", "Reward_Points", "RiskReward_Ratio");
         FileClose(h);
     }
 }
@@ -299,6 +313,23 @@ void LogTrade(string type, double entry, double sl, double tp, double lots, stri
     CopyBuffer(h_rsi, 0, 0, 1, rsi);
     CopyBuffer(h_atr, 0, 0, 1, atr);
     
+    // Calculate Risk-to-Reward Ratio
+    double risk_points = 0.0;
+    double reward_points = 0.0;
+    double rr_ratio = 0.0;
+    
+    if(sl > 0 && tp > 0)
+    {
+        // Calculate risk and reward in points
+        double point = SymbolInfoDouble(g_active_symbol, SYMBOL_POINT);
+        risk_points = MathAbs(entry - sl) / point;
+        reward_points = MathAbs(tp - entry) / point;
+        
+        // Calculate R:R ratio (avoid division by zero)
+        if(risk_points > 0)
+            rr_ratio = reward_points / risk_points;
+    }
+    
     int h = FileOpen(g_log_file, FILE_READ|FILE_WRITE|FILE_CSV|FILE_COMMON, ';');
     if(h != INVALID_HANDLE)
     {
@@ -308,8 +339,14 @@ void LogTrade(string type, double entry, double sl, double tp, double lots, stri
                   AccountInfoDouble(ACCOUNT_BALANCE),
                   AccountInfoDouble(ACCOUNT_EQUITY),
                   GetCurrentSpreadPips(),
-                  atr[0], rsi[0], ema_f[0], ema_s[0]);
+                  atr[0], rsi[0], ema_f[0], ema_s[0],
+                  risk_points, reward_points, rr_ratio);
         FileClose(h);
+        
+        // Also print R:R ratio to terminal for quick reference
+        if(rr_ratio > 0)
+            Print("Trade R:R Ratio: ", DoubleToString(rr_ratio, 2), " (Risk: ", 
+                  DoubleToString(risk_points, 1), " pts, Reward: ", DoubleToString(reward_points, 1), " pts)");
     }
 }
 
@@ -452,32 +489,178 @@ SRLevel FindNearestSR(ENUM_POSITION_TYPE trade_type, int lookback)
     return sr;
 }
 
+//=========================== PIVOT & FIBONACCI =====================
+double CalculatePivotLevel(ENUM_POSITION_TYPE trade_type, bool use_resistance)
+{
+    if(!InpUsePivotLevels) return 0.0;
+    
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    if(CopyRates(g_active_symbol, InpTimeframe, 0, InpPivotLookback, rates) < InpPivotLookback)
+        return 0.0;
+    
+    // Find highest high and lowest low for pivot calculation
+    double highest = rates[0].high;
+    double lowest = rates[0].low;
+    double close = rates[0].close;
+    
+    for(int i = 1; i < InpPivotLookback; i++)
+    {
+        if(rates[i].high > highest) highest = rates[i].high;
+        if(rates[i].low < lowest) lowest = rates[i].low;
+        close = rates[i].close; // Last close
+    }
+    
+    // Calculate pivot point
+    double pivot = (highest + lowest + close) / 3.0;
+    
+    if(use_resistance)
+    {
+        // Resistance level (for longs - TP target)
+        double resistance = 2.0 * pivot - lowest;
+        return resistance;
+    }
+    else
+    {
+        // Support level (for shorts - TP target)
+        double support = 2.0 * pivot - highest;
+        return support;
+    }
+}
+
+double CalculateFibonacciLevel(ENUM_POSITION_TYPE trade_type, bool use_resistance)
+{
+    if(!InpUseFibLevels) return 0.0;
+    
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    int lookback = 50; // Need more bars for meaningful swing
+    if(CopyRates(g_active_symbol, InpTimeframe, 0, lookback, rates) < lookback)
+        return 0.0;
+    
+    // Find recent swing high and low
+    double swing_high = rates[0].high;
+    double swing_low = rates[0].low;
+    int high_idx = 0;
+    int low_idx = 0;
+    
+    for(int i = 5; i < lookback - 5; i++)
+    {
+        // Check for swing high (local maximum)
+        if(rates[i].high > rates[i-1].high && rates[i].high > rates[i-2].high &&
+           rates[i].high > rates[i+1].high && rates[i].high > rates[i+2].high)
+        {
+            if(rates[i].high > swing_high)
+            {
+                swing_high = rates[i].high;
+                high_idx = i;
+            }
+        }
+        
+        // Check for swing low (local minimum)
+        if(rates[i].low < rates[i-1].low && rates[i].low < rates[i-2].low &&
+           rates[i].low < rates[i+1].low && rates[i].low < rates[i+2].low)
+        {
+            if(rates[i].low < swing_low)
+            {
+                swing_low = rates[i].low;
+                low_idx = i;
+            }
+        }
+    }
+    
+    if(swing_high <= swing_low) return 0.0; // Invalid swing
+    
+    double range = swing_high - swing_low;
+    if(range <= 0) return 0.0;
+    
+    // Fibonacci retracement levels (38.2%, 50%, 61.8%)
+    // For longs (resistance): 61.8% retracement from swing high
+    // For shorts (support): 38.2% retracement from swing low
+    if(use_resistance)
+    {
+        // Resistance level (from swing high down)
+        double fib_level = swing_high - (range * 0.382); // 38.2% retracement
+        return fib_level;
+    }
+    else
+    {
+        // Support level (from swing low up)
+        double fib_level = swing_low + (range * 0.382); // 38.2% retracement
+        return fib_level;
+    }
+}
+
 double CalculateDynamicTP(ENUM_POSITION_TYPE trade_type, double entry_price)
 {
     if(!InpUseDynamicTP) return 0.0;
     
-    SRLevel sr = FindNearestSR(trade_type, InpSR_Lookback);
-    if(sr.price == 0.0 || sr.strength < 2) return 0.0; // Not enough strength
-    
     double point = SymbolInfoDouble(g_active_symbol, SYMBOL_POINT);
     double buffer = PipsToPoints(InpTP_BufferPips);
+    double best_tp = 0.0;
+    double best_priority = 0.0;
     
-    if(trade_type == POSITION_TYPE_BUY)
+    // Option 1: Support/Resistance levels (priority 3)
+    SRLevel sr = FindNearestSR(trade_type, InpSR_Lookback);
+    if(sr.price > 0.0 && sr.strength >= 2)
     {
-        // For long: TP just below resistance
-        double tp = sr.price - buffer;
-        if(tp > entry_price + (point * 10)) // Ensure TP is reasonable distance
-            return tp;
-    }
-    else
-    {
-        // For short: TP just above support
-        double tp = sr.price + buffer;
-        if(tp < entry_price - (point * 10))
-            return tp;
+        double sr_tp = 0.0;
+        if(trade_type == POSITION_TYPE_BUY)
+            sr_tp = sr.price - buffer;
+        else
+            sr_tp = sr.price + buffer;
+        
+        if((trade_type == POSITION_TYPE_BUY && sr_tp > entry_price + (point * 10)) ||
+           (trade_type == POSITION_TYPE_SELL && sr_tp < entry_price - (point * 10)))
+        {
+            best_tp = sr_tp;
+            best_priority = 3.0 + (sr.strength * 0.1); // S/R with higher strength wins
+        }
     }
     
-    return 0.0;
+    // Option 2: Pivot Point levels (priority 2)
+    double pivot_level = CalculatePivotLevel(trade_type, (trade_type == POSITION_TYPE_BUY));
+    if(pivot_level > 0)
+    {
+        double pivot_tp = pivot_level - buffer; // For longs
+        if(trade_type == POSITION_TYPE_SELL)
+            pivot_tp = pivot_level + buffer; // For shorts
+        
+        double priority = 2.0;
+        if((trade_type == POSITION_TYPE_BUY && pivot_tp > entry_price + (point * 10)) ||
+           (trade_type == POSITION_TYPE_SELL && pivot_tp < entry_price - (point * 10)))
+        {
+            if(best_tp == 0.0 || priority > best_priority || 
+               (MathAbs(pivot_tp - entry_price) < MathAbs(best_tp - entry_price)))
+            {
+                best_tp = pivot_tp;
+                best_priority = priority;
+            }
+        }
+    }
+    
+    // Option 3: Fibonacci levels (priority 2.5)
+    double fib_level = CalculateFibonacciLevel(trade_type, (trade_type == POSITION_TYPE_BUY));
+    if(fib_level > 0)
+    {
+        double fib_tp = fib_level - buffer; // For longs
+        if(trade_type == POSITION_TYPE_SELL)
+            fib_tp = fib_level + buffer; // For shorts
+        
+        double priority = 2.5;
+        if((trade_type == POSITION_TYPE_BUY && fib_tp > entry_price + (point * 10)) ||
+           (trade_type == POSITION_TYPE_SELL && fib_tp < entry_price - (point * 10)))
+        {
+            if(best_tp == 0.0 || priority > best_priority ||
+               (MathAbs(fib_tp - entry_price) < MathAbs(best_tp - entry_price)))
+            {
+                best_tp = fib_tp;
+                best_priority = priority;
+            }
+        }
+    }
+    
+    return best_tp;
 }
 
 //=========================== SLIPPAGE MANAGEMENT ==================
@@ -707,6 +890,41 @@ bool CheckMTFReversal(ENUM_POSITION_TYPE trade_type)
     }
 }
 
+bool CheckHigherTFTrend(bool isLong)
+{
+    // Use same higher TF as reversal confirmation
+    ENUM_TIMEFRAMES tf = InpMTF_Period;
+    int h_rsi_mtf = iRSI(g_active_symbol, tf, InpRSI_Period, PRICE_CLOSE);
+    int h_ema_f_mtf = iMA(g_active_symbol, tf, InpEMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+    int h_ema_s_mtf = iMA(g_active_symbol, tf, InpEMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+    if(h_rsi_mtf == INVALID_HANDLE || h_ema_f_mtf == INVALID_HANDLE || h_ema_s_mtf == INVALID_HANDLE)
+        return true; // don't block if indicator creation fails
+
+    double rsi_mtf[], ema_f_mtf[], ema_s_mtf[];
+    ArraySetAsSeries(rsi_mtf, true);
+    ArraySetAsSeries(ema_f_mtf, true);
+    ArraySetAsSeries(ema_s_mtf, true);
+    ArrayResize(rsi_mtf, 1);
+    ArrayResize(ema_f_mtf, 1);
+    ArrayResize(ema_s_mtf, 1);
+
+    bool ok = true;
+    if(CopyBuffer(h_rsi_mtf, 0, 0, 1, rsi_mtf) < 1) ok = false;
+    if(CopyBuffer(h_ema_f_mtf, 0, 0, 1, ema_f_mtf) < 1) ok = false;
+    if(CopyBuffer(h_ema_s_mtf, 0, 0, 1, ema_s_mtf) < 1) ok = false;
+
+    IndicatorRelease(h_rsi_mtf);
+    IndicatorRelease(h_ema_f_mtf);
+    IndicatorRelease(h_ema_s_mtf);
+
+    if(!ok) return true; // fail-open
+
+    if(isLong)
+        return (ema_f_mtf[0] > ema_s_mtf[0] && rsi_mtf[0] >= 50.0);
+    else
+        return (ema_f_mtf[0] < ema_s_mtf[0] && rsi_mtf[0] <= 50.0);
+}
+
 //=========================== ENTRY LOGIC ===========================
 bool CheckLongEntry()
 {
@@ -754,11 +972,16 @@ bool CheckLongEntry()
     // Volume/volatility confirmation
     bool volume_ok = CheckVolumeConfirmation();
     
+    // Higher timeframe confirmation/bias
+    bool higher_tf_ok = true;
+    if(InpMTF_EntryConfirm || InpBiasUseHigherTF)
+        higher_tf_ok = CheckHigherTFTrend(true);
+    
     // Require both EMA alignment AND price confirmation for better accuracy
     bool ema_aligned = (ema_f[0] > ema_s[0]);
     bool strong_signal = crossover || (price_above && ema_aligned && ema_f[0] > ema_f[1]); // EMA rising
     
-    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok;
+    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok && higher_tf_ok;
 }
 
 bool CheckShortEntry()
@@ -807,11 +1030,16 @@ bool CheckShortEntry()
     // Volume/volatility confirmation
     bool volume_ok = CheckVolumeConfirmation();
     
+    // Higher timeframe confirmation/bias
+    bool higher_tf_ok = true;
+    if(InpMTF_EntryConfirm || InpBiasUseHigherTF)
+        higher_tf_ok = CheckHigherTFTrend(false);
+    
     // Require both EMA alignment AND price confirmation for better accuracy
     bool ema_aligned = (ema_f[0] < ema_s[0]);
     bool strong_signal = crossover || (price_below && ema_aligned && ema_f[0] < ema_f[1]); // EMA falling
     
-    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok;
+    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok && higher_tf_ok;
 }
 
 int CountOpenTrades()
@@ -913,14 +1141,23 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
     string reason_parts = "";
     int reason_count = 0;
     
+    // Track indicator category confirmations (for multi-confirmation requirement)
+    bool rsi_category = false;
+    bool macd_category = false;
+    bool candle_category = false;
+    bool ema_category = false;
+    bool bb_category = false;
+    bool pa_category = false;
+    
     if(trade_type == POSITION_TYPE_BUY)
     {
         // Bearish reversal signals
         
-        // 1. RSI overbought and turning down
+        // 1. RSI overbought and turning down (RSI CATEGORY)
         if(rsi[0] > 70 && rsi[0] < rsi[1])
         {
             score += 0.25;
+            rsi_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "RSI_overbought_turn";
@@ -929,15 +1166,17 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
         if(rates[0].high > rates[2].high && rsi[0] < rsi[2])
         {
             score += 0.30;
+            rsi_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "RSI_bearish_divergence";
         }
         
-        // 2. MACD histogram flip negative
+        // 2. MACD histogram flip negative (MACD CATEGORY)
         if(macd_hist[0] < 0 && macd_hist[1] > 0)
         {
             score += 0.25;
+            macd_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "MACD_flip_bearish";
@@ -946,21 +1185,23 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
         if(macd_main[0] < macd_signal[0] && macd_main[1] >= macd_signal[1])
         {
             score += 0.20;
+            macd_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "MACD_cross_bearish";
         }
         
-        // 3. EMA fast crosses below slow (trend reversal)
+        // 3. EMA fast crosses below slow (EMA CATEGORY - trend reversal)
         if(ema_f[0] < ema_s[0] && ema_f[1] >= ema_s[1])
         {
             score += 0.30;
+            ema_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "EMA_cross_bearish";
         }
         
-        // 4. Bearish engulfing candle
+        // 4. Bearish engulfing candle (CANDLE CATEGORY)
         double body_now = MathAbs(rates[0].close - rates[0].open);
         double body_prev = MathAbs(rates[1].close - rates[1].open);
         bool bearish_engulf = (body_now > body_prev * 1.2) &&
@@ -971,35 +1212,39 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
         if(bearish_engulf)
         {
             score += 0.20;
+            candle_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "Bearish_engulfing";
         }
         
-        // 5. Doji at high (indecision)
+        // 5. Doji at high (CANDLE CATEGORY - indecision)
         double range = rates[0].high - rates[0].low;
         bool doji = (range > 0 && body_now / range < 0.1 && body_now > 0);
         if(doji && rates[0].high > rates[1].high)
         {
             score += 0.15;
+            candle_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "Doji_at_high";
         }
         
-        // 6. Bollinger Band bounce from upper band (bearish reversal)
+        // 6. Bollinger Band bounce from upper band (BB CATEGORY - bearish reversal)
         if(bb_available && rates[0].high >= bb_upper[0] * 0.999) // Within 0.1% of upper band
         {
             score += 0.20;
+            bb_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "BB_bounce_upper";
         }
         
-        // 7. Price action: Lower high structure (bearish reversal pattern)
+        // 7. Price action: Lower high structure (PA CATEGORY - bearish reversal pattern)
         if(price_action_reversal)
         {
             score += 0.25;
+            pa_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "PA_lower_high";
@@ -1009,10 +1254,11 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
     {
         // Bullish reversal signals
         
-        // 1. RSI oversold and turning up
+        // 1. RSI oversold and turning up (RSI CATEGORY)
         if(rsi[0] < 30 && rsi[0] > rsi[1])
         {
             score += 0.25;
+            rsi_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "RSI_oversold_turn";
@@ -1021,15 +1267,17 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
         if(rates[0].low < rates[2].low && rsi[0] > rsi[2])
         {
             score += 0.30;
+            rsi_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "RSI_bullish_divergence";
         }
         
-        // 2. MACD histogram flip positive
+        // 2. MACD histogram flip positive (MACD CATEGORY)
         if(macd_hist[0] > 0 && macd_hist[1] < 0)
         {
             score += 0.25;
+            macd_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "MACD_flip_bullish";
@@ -1038,21 +1286,23 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
         if(macd_main[0] > macd_signal[0] && macd_main[1] <= macd_signal[1])
         {
             score += 0.20;
+            macd_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "MACD_cross_bullish";
         }
         
-        // 3. EMA fast crosses above slow (trend reversal)
+        // 3. EMA fast crosses above slow (EMA CATEGORY - trend reversal)
         if(ema_f[0] > ema_s[0] && ema_f[1] <= ema_s[1])
         {
             score += 0.30;
+            ema_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "EMA_cross_bullish";
         }
         
-        // 4. Bullish engulfing candle
+        // 4. Bullish engulfing candle (CANDLE CATEGORY)
         double body_now = MathAbs(rates[0].close - rates[0].open);
         double body_prev = MathAbs(rates[1].close - rates[1].open);
         bool bullish_engulf = (body_now > body_prev * 1.2) &&
@@ -1063,38 +1313,63 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
         if(bullish_engulf)
         {
             score += 0.20;
+            candle_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "Bullish_engulfing";
         }
         
-        // 5. Doji at low (indecision)
+        // 5. Doji at low (CANDLE CATEGORY - indecision)
         double range = rates[0].high - rates[0].low;
         bool doji = (range > 0 && body_now / range < 0.1 && body_now > 0);
         if(doji && rates[0].low < rates[1].low)
         {
             score += 0.15;
+            candle_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "Doji_at_low";
         }
         
-        // 6. Bollinger Band bounce from lower band (bullish reversal)
+        // 6. Bollinger Band bounce from lower band (BB CATEGORY - bullish reversal)
         if(bb_available && rates[0].low <= bb_lower[0] * 1.001) // Within 0.1% of lower band
         {
             score += 0.20;
+            bb_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "BB_bounce_lower";
         }
         
-        // 7. Price action: Higher low structure (bullish reversal pattern)
+        // 7. Price action: Higher low structure (PA CATEGORY - bullish reversal pattern)
         if(price_action_reversal)
         {
             score += 0.25;
+            pa_category = true;
             if(reason_count > 0) reason_parts += "+";
             reason_count++;
             reason_parts += "PA_higher_low";
+        }
+    }
+    
+    // MULTI-INDICATOR CONFIRMATION: Count how many categories confirmed
+    int category_count = 0;
+    if(rsi_category) category_count++;
+    if(macd_category) category_count++;
+    if(candle_category) category_count++;
+    if(ema_category) category_count++;
+    if(bb_category) category_count++;
+    if(pa_category) category_count++;
+    
+    // Require minimum indicator categories to confirm (default: RSI + MACD + Candle)
+    bool multi_confirmed = true;
+    if(InpReversalMultiConfirm)
+    {
+        multi_confirmed = (category_count >= InpReversalMinIndicators);
+        if(!multi_confirmed)
+        {
+            // Don't exit - insufficient confirmation
+            return rev;
         }
     }
     
@@ -1126,7 +1401,7 @@ ReversalSignal DetectReversal(ENUM_POSITION_TYPE trade_type)
     
     threshold = MathMin(0.9, threshold); // Cap at 0.9
     
-    if(score >= threshold)
+    if(score >= threshold && multi_confirmed)
     {
         // Multi-timeframe confirmation: Only exit if higher TF also shows reversal
         if(InpMTF_ReversalConf)
@@ -1513,7 +1788,6 @@ bool TryEnterLong()
     double sl = ask - sl_distance;
     double tp = 0.0;
     
-    // Try dynamic TP first
     if(InpUseDynamicTP)
     {
         tp = CalculateDynamicTP(POSITION_TYPE_BUY, ask);
@@ -1522,15 +1796,12 @@ bool TryEnterLong()
             Print("Using dynamic TP @ ", tp, " (from S/R level)");
         }
     }
-    
-    // Fallback to ATR-based TP
     if(tp <= 0)
     {
         double tp_distance = atr[0] * InpTP_Multiplier;
         tp = ask + tp_distance;
     }
     
-    // Check minimum stop level
     double min_stop = SymbolInfoInteger(g_active_symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
     if(MathAbs(ask - sl) < min_stop) sl = ask - min_stop - point;
     if(MathAbs(tp - ask) < min_stop) tp = ask + min_stop + point;
@@ -1538,24 +1809,16 @@ bool TryEnterLong()
     double lots = CalculateLotSize(sl_distance / point);
     if(lots <= 0) return false;
     
-    g_trade.SetExpertMagicNumber(InpMagicNumber);
-    g_trade.SetDeviationInPoints((int)PipsToPoints(GetAdaptiveSlippagePips()));
-    g_trade.SetTypeFilling(ORDER_FILLING_FOK);
-    
-    if(g_trade.Buy(lots, g_active_symbol, ask, sl, tp, "EURUSDm Long"))
+    bool ok = PlaceOrderWithRetry(ORDER_TYPE_BUY, lots, ask, sl, tp, "EURUSDm Long");
+    if(ok)
     {
-        ulong ticket = g_trade.ResultOrder();
-        if(ticket > 0)
-        {
-            // Find the position ticket (deal creates position)
-            Sleep(100); // Brief delay for position to be created
-            if(g_pos.SelectByTicket(ticket) || g_pos.SelectByIndex(PositionsTotal() - 1))
-            {
-                AddTradeState(g_pos.Ticket());
-            }
-        }
         Print("LONG entry: ", lots, " lots @ ", ask, " SL=", sl, " TP=", tp);
         LogTrade("LONG", ask, sl, tp, lots, "EMA crossover + RSI");
+        // Best-effort trade state association (optional)
+        Sleep(100);
+        for(int i=PositionsTotal()-1;i>=0;i--){ if(g_pos.SelectByIndex(i) && g_pos.Symbol()==g_active_symbol && g_pos.Magic()==InpMagicNumber) { AddTradeState(g_pos.Ticket()); break; } }
+        // Optional scale-in attempt (non-blocking)
+        if(InpAllowScaleIn) TryScaleIn(POSITION_TYPE_BUY);
         return true;
     }
     else
@@ -1581,7 +1844,6 @@ bool TryEnterShort()
     double sl = bid + sl_distance;
     double tp = 0.0;
     
-    // Try dynamic TP first
     if(InpUseDynamicTP)
     {
         tp = CalculateDynamicTP(POSITION_TYPE_SELL, bid);
@@ -1590,15 +1852,12 @@ bool TryEnterShort()
             Print("Using dynamic TP @ ", tp, " (from S/R level)");
         }
     }
-    
-    // Fallback to ATR-based TP
     if(tp <= 0)
     {
         double tp_distance = atr[0] * InpTP_Multiplier;
         tp = bid - tp_distance;
     }
     
-    // Check minimum stop level
     double min_stop = SymbolInfoInteger(g_active_symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
     if(MathAbs(sl - bid) < min_stop) sl = bid + min_stop + point;
     if(MathAbs(bid - tp) < min_stop) tp = bid - min_stop - point;
@@ -1606,24 +1865,14 @@ bool TryEnterShort()
     double lots = CalculateLotSize(sl_distance / point);
     if(lots <= 0) return false;
     
-    g_trade.SetExpertMagicNumber(InpMagicNumber);
-    g_trade.SetDeviationInPoints((int)PipsToPoints(GetAdaptiveSlippagePips()));
-    g_trade.SetTypeFilling(ORDER_FILLING_FOK);
-    
-    if(g_trade.Sell(lots, g_active_symbol, bid, sl, tp, "EURUSDm Short"))
+    bool ok = PlaceOrderWithRetry(ORDER_TYPE_SELL, lots, bid, sl, tp, "EURUSDm Short");
+    if(ok)
     {
-        ulong ticket = g_trade.ResultOrder();
-        if(ticket > 0)
-        {
-            // Find the position ticket (deal creates position)
-            Sleep(100); // Brief delay for position to be created
-            if(g_pos.SelectByTicket(ticket) || g_pos.SelectByIndex(PositionsTotal() - 1))
-            {
-                AddTradeState(g_pos.Ticket());
-            }
-        }
         Print("SHORT entry: ", lots, " lots @ ", bid, " SL=", sl, " TP=", tp);
         LogTrade("SHORT", bid, sl, tp, lots, "EMA crossover + RSI");
+        Sleep(100);
+        for(int i=PositionsTotal()-1;i>=0;i--){ if(g_pos.SelectByIndex(i) && g_pos.Symbol()==g_active_symbol && g_pos.Magic()==InpMagicNumber) { AddTradeState(g_pos.Ticket()); break; } }
+        if(InpAllowScaleIn) TryScaleIn(POSITION_TYPE_SELL);
         return true;
     }
     else
@@ -1806,4 +2055,114 @@ void OnTimer() // Called periodically - update daily balance reset
         last_day = dt.day;
         Print("Daily balance reset. New starting balance: ", g_daily_balance_start);
     }
+}
+
+//=========================== ORDER EXECUTION ========================
+bool PlaceOrderWithRetry(ENUM_ORDER_TYPE type, double lots, double price, double sl, double tp, string comment)
+{
+    int attempts = 0;
+    double slippage_pips = GetAdaptiveSlippagePips();
+    bool is_buy = (type == ORDER_TYPE_BUY);
+    while(attempts <= InpOrderRetryCount)
+    {
+        g_trade.SetExpertMagicNumber(InpMagicNumber);
+        g_trade.SetDeviationInPoints((int)PipsToPoints(slippage_pips));
+        g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+        bool ok = false;
+        if(is_buy)
+            ok = g_trade.Buy(lots, g_active_symbol, price, sl, tp, comment);
+        else
+            ok = g_trade.Sell(lots, g_active_symbol, price, sl, tp, comment);
+        if(ok) return true;
+        int rc = g_trade.ResultRetcode();
+        // Retry-worthy retcodes
+        if(rc==TRADE_RETCODE_REQUOTE || rc==TRADE_RETCODE_PRICE_OFF || rc==TRADE_RETCODE_REJECT || rc==TRADE_RETCODE_OFFQUOTES)
+        {
+            attempts++;
+            // widen slippage slightly each retry
+            slippage_pips = MathMin(slippage_pips * 1.25, InpMaxSlippage * 2.0);
+            Sleep((uint)MathMax(50, InpOrderRetryDelayMs));
+            continue;
+        }
+        // Not retryable
+        break;
+    }
+    return false;
+}
+
+//=========================== SCALE-IN LOGIC ========================
+int CountAddsForDirection(ENUM_POSITION_TYPE type)
+{
+    int count = 0;
+    for(int i=0;i<PositionsTotal();i++)
+    {
+        if(!g_pos.SelectByIndex(i)) continue;
+        if(g_pos.Symbol()!=g_active_symbol || g_pos.Magic()!=InpMagicNumber) continue;
+        if(g_pos.PositionType()==type) count++;
+    }
+    return MathMax(0, count-1); // excludes initial entry
+}
+
+double GetAvgATR()
+{
+    double atr_vals[]; ArraySetAsSeries(atr_vals,true); ArrayResize(atr_vals,20);
+    if(CopyBuffer(h_atr,0,0,20,atr_vals)<5) return 0.0;
+    double s=0; int n=0; for(int i=0;i<ArraySize(atr_vals);i++){ if(atr_vals[i]>0){s+=atr_vals[i]; n++;}}
+    return (n>0? s/n : 0.0);
+}
+
+bool CanScaleIn(ENUM_POSITION_TYPE type)
+{
+    if(!InpAllowScaleIn) return false;
+    // If broker not hedging, still okay (netting increases net position), but honor add cap
+    if(CountAddsForDirection(type) >= InpScaleInMaxAdds) return false;
+    double atr_avg = GetAvgATR(); if(atr_avg<=0) return false;
+    double point = SymbolInfoDouble(g_active_symbol, SYMBOL_POINT);
+    double current = (type==POSITION_TYPE_BUY)? SymbolInfoDouble(g_active_symbol,SYMBOL_BID):SymbolInfoDouble(g_active_symbol,SYMBOL_ASK);
+    // Find nearest existing position in same direction
+    double nearest_entry = 0.0;
+    for(int i=0;i<PositionsTotal();i++)
+    {
+        if(!g_pos.SelectByIndex(i)) continue;
+        if(g_pos.Symbol()!=g_active_symbol || g_pos.Magic()!=InpMagicNumber) continue;
+        if(g_pos.PositionType()!=type) continue;
+        if(nearest_entry==0.0) nearest_entry = g_pos.PriceOpen();
+        else if(type==POSITION_TYPE_BUY) nearest_entry = MathMax(nearest_entry, g_pos.PriceOpen());
+        else nearest_entry = MathMin(nearest_entry, g_pos.PriceOpen());
+    }
+    if(nearest_entry==0.0) return false;
+    double min_dist = InpScaleInATRDistance * atr_avg;
+    if(type==POSITION_TYPE_BUY && (current - nearest_entry) < min_dist) return false;
+    if(type==POSITION_TYPE_SELL && (nearest_entry - current) < min_dist) return false;
+    // Require current profit >= threshold
+    double th_points = InpScaleInMinProfitATR * (atr_avg/point);
+    double profit_points = 0.0;
+    for(int i=0;i<PositionsTotal();i++)
+    {
+        if(!g_pos.SelectByIndex(i)) continue;
+        if(g_pos.Symbol()!=g_active_symbol || g_pos.Magic()!=InpMagicNumber) continue;
+        if(g_pos.PositionType()!=type) continue;
+        double entry = g_pos.PriceOpen();
+        profit_points += (type==POSITION_TYPE_BUY)? (current-entry)/point : (entry-current)/point;
+    }
+    // average profit per position
+    int same = CountAddsForDirection(type)+1; if(same<=0) same=1;
+    double avg_profit_points = profit_points / same;
+    return (avg_profit_points >= th_points);
+}
+
+bool TryScaleIn(ENUM_POSITION_TYPE type)
+{
+    if(!CanScaleIn(type)) return false;
+    double atr[]; ArraySetAsSeries(atr,true); ArrayResize(atr,1); if(CopyBuffer(h_atr,0,0,1,atr)<1) return false;
+    double point = SymbolInfoDouble(g_active_symbol, SYMBOL_POINT);
+    double price = (type==POSITION_TYPE_BUY)? SymbolInfoDouble(g_active_symbol,SYMBOL_ASK):SymbolInfoDouble(g_active_symbol,SYMBOL_BID);
+    double sl_dist = atr[0]*InpSL_Multiplier;
+    double tp_dist = atr[0]*InpTP_Multiplier;
+    double sl = (type==POSITION_TYPE_BUY)? (price - sl_dist):(price + sl_dist);
+    double tp = (type==POSITION_TYPE_BUY)? (price + tp_dist):(price - tp_dist);
+    double lots = CalculateLotSize(sl_dist/point); if(lots<=0) return false;
+    bool ok = PlaceOrderWithRetry((type==POSITION_TYPE_BUY)? ORDER_TYPE_BUY:ORDER_TYPE_SELL, lots, price, sl, tp, "EURUSDm ScaleIn");
+    if(ok) Print("Scale-in executed: ", lots, " @ ", price);
+    return ok;
 }
