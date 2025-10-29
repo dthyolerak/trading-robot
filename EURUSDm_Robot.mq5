@@ -15,33 +15,34 @@
 //=========================== STRATEGY INPUTS =======================
 input group "=== SYMBOL & TIMEFRAME ===";
 input string   InpSymbol           = "EURUSDm";     // Trading symbol (auto-detect if empty)
-input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M15;    // Primary timeframe
+input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1;     // Primary timeframe (M1 for higher accuracy)
 
 input group "=== EMA CROSSOVER STRATEGY ===";
-input int      InpEMA_Fast         = 9;             // Fast EMA period
-input int      InpEMA_Slow         = 21;            // Slow EMA period
+input int      InpEMA_Fast         = 12;            // Fast EMA period (optimized for M1)
+input int      InpEMA_Slow         = 26;            // Slow EMA period (optimized for M1)
 input int      InpRSI_Period       = 14;            // RSI period
-input double   InpRSI_LongMin      = 45.0;          // RSI minimum for long entry
-input double   InpRSI_ShortMax     = 55.0;          // RSI maximum for short entry
+input double   InpRSI_LongMin      = 50.0;          // RSI minimum for long entry (tighter for accuracy)
+input double   InpRSI_ShortMax     = 50.0;           // RSI maximum for short entry (tighter for accuracy)
+input int      InpSignalConfirmation = 2;           // Require N consecutive bars with signal
 
 input group "=== ATR-BASED EXIT RULES ===";
 input int      InpATR_Period       = 14;            // ATR period
-input double   InpSL_Multiplier    = 2.0;           // SL = ATR * multiplier
-input double   InpTP_Multiplier    = 3.0;           // TP = ATR * multiplier
+input double   InpSL_Multiplier    = 1.5;           // SL = ATR * multiplier (smaller for M1)
+input double   InpTP_Multiplier    = 2.5;           // TP = ATR * multiplier (smaller for M1)
 input bool     InpUseTrailing      = true;          // Enable trailing stop
-input double   InpTrailStart       = 2.0;           // Start trailing after (ATR multiples)
-input double   InpTrailStep        = 10.0;          // Trailing stop step (pips)
+input double   InpTrailStart       = 1.0;           // Start trailing after (ATR multiples - faster for M1)
+input double   InpTrailStep        = 5.0;            // Trailing stop step (pips - tighter for M1)
 input bool     InpUseBreakEven     = true;          // Move to breakeven after trigger
 input double   InpBE_TriggerATR    = 1.5;           // BE trigger (ATR multiples)
 input int      InpMaxTradeLifeMin  = 0;             // Max trade duration (0=unlimited)
 
 input group "=== RISK MANAGEMENT ===";
-input double   InpRiskPercent      = 1.0;           // Risk % per trade
+input double   InpRiskPercent      = 0.5;          // Risk % per trade (lower for M1)
 input double   InpFixedLotSize     = 0.0;           // Fixed lot size (0=use risk%)
 input int      InpMaxOpenTrades    = 1;             // Maximum concurrent trades
 input double   InpDailyLossLimit   = 5.0;           // Daily loss limit (%)
-input double   InpMaxSpread        = 2.5;           // Maximum spread (pips)
-input double   InpMaxSlippage      = 3.0;           // Maximum slippage (pips)
+input double   InpMaxSpread        = 1.5;           // Maximum spread (pips - tighter for M1)
+input double   InpMaxSlippage      = 2.0;           // Maximum slippage (pips - tighter for M1)
 
 input group "=== TRADING HOURS & FILTERS ===";
 input bool     InpTradeHoursEnabled = false;        // Enable hour filter
@@ -73,13 +74,17 @@ int            h_atr      = INVALID_HANDLE;
 datetime       g_session_start = 0;
 double         g_start_balance = 0.0;
 double         g_daily_balance_start = 0.0;
-double         g_last_bar_time = 0;
+datetime       g_last_bar_time = 0;
 
 // Symbol detection
 string         g_active_symbol = "";
 
 // Logging
 string         g_log_file = "";
+
+// Signal confirmation tracking
+int            g_long_signal_count = 0;
+int            g_short_signal_count = 0;
 
 //=========================== UTILITIES =============================
 string DetectEURUSDSymbol()
@@ -157,11 +162,15 @@ void LogTrade(string type, double entry, double sl, double tp, double lots, stri
 {
     if(!InpLogToCSV) return;
     
-    double ema_f[1], ema_s[1], rsi[1], atr[1];
+    double ema_f[], ema_s[], rsi[], atr[];
     ArraySetAsSeries(ema_f, true);
     ArraySetAsSeries(ema_s, true);
     ArraySetAsSeries(rsi, true);
     ArraySetAsSeries(atr, true);
+    ArrayResize(ema_f, 1);
+    ArrayResize(ema_s, 1);
+    ArrayResize(rsi, 1);
+    ArrayResize(atr, 1);
     
     CopyBuffer(h_ema_fast, 0, 0, 1, ema_f);
     CopyBuffer(h_ema_slow, 0, 0, 1, ema_s);
@@ -233,11 +242,15 @@ double CalculateLotSize(double sl_distance_points)
 //=========================== ENTRY LOGIC ===========================
 bool CheckLongEntry()
 {
-    double ema_f[2], ema_s[2], rsi[1], atr[1];
+    double ema_f[], ema_s[], rsi[], atr[];
     ArraySetAsSeries(ema_f, true);
     ArraySetAsSeries(ema_s, true);
     ArraySetAsSeries(rsi, true);
     ArraySetAsSeries(atr, true);
+    ArrayResize(ema_f, 2);
+    ArrayResize(ema_s, 2);
+    ArrayResize(rsi, 1);
+    ArrayResize(atr, 1);
     
     if(CopyBuffer(h_ema_fast, 0, 0, 2, ema_f) < 2) return false;
     if(CopyBuffer(h_ema_slow, 0, 0, 2, ema_s) < 2) return false;
@@ -255,8 +268,8 @@ bool CheckLongEntry()
     // Price above Fast EMA
     bool price_above = (close_price > ema_f[0]);
     
-    // RSI filter
-    bool rsi_ok = (rsi[0] > InpRSI_LongMin);
+    // RSI filter - require stronger signals for M1
+    bool rsi_ok = (rsi[0] > InpRSI_LongMin && rsi[0] < 70); // Avoid overbought
     
     // Volatility filter
     bool vol_ok = true;
@@ -265,16 +278,24 @@ bool CheckLongEntry()
         vol_ok = (atr[0] >= InpATR_MinThreshold && atr[0] <= InpATR_MaxThreshold);
     }
     
-    return (crossover || (price_above && ema_f[0] > ema_s[0])) && rsi_ok && vol_ok;
+    // Require both EMA alignment AND price confirmation for better accuracy
+    bool ema_aligned = (ema_f[0] > ema_s[0]);
+    bool strong_signal = crossover || (price_above && ema_aligned && ema_f[0] > ema_f[1]); // EMA rising
+    
+    return strong_signal && rsi_ok && vol_ok;
 }
 
 bool CheckShortEntry()
 {
-    double ema_f[2], ema_s[2], rsi[1], atr[1];
+    double ema_f[], ema_s[], rsi[], atr[];
     ArraySetAsSeries(ema_f, true);
     ArraySetAsSeries(ema_s, true);
     ArraySetAsSeries(rsi, true);
     ArraySetAsSeries(atr, true);
+    ArrayResize(ema_f, 2);
+    ArrayResize(ema_s, 2);
+    ArrayResize(rsi, 1);
+    ArrayResize(atr, 1);
     
     if(CopyBuffer(h_ema_fast, 0, 0, 2, ema_f) < 2) return false;
     if(CopyBuffer(h_ema_slow, 0, 0, 2, ema_s) < 2) return false;
@@ -292,8 +313,8 @@ bool CheckShortEntry()
     // Price below Fast EMA
     bool price_below = (close_price < ema_f[0]);
     
-    // RSI filter
-    bool rsi_ok = (rsi[0] < InpRSI_ShortMax);
+    // RSI filter - require stronger signals for M1
+    bool rsi_ok = (rsi[0] < InpRSI_ShortMax && rsi[0] > 30); // Avoid oversold
     
     // Volatility filter
     bool vol_ok = true;
@@ -302,7 +323,11 @@ bool CheckShortEntry()
         vol_ok = (atr[0] >= InpATR_MinThreshold && atr[0] <= InpATR_MaxThreshold);
     }
     
-    return (crossover || (price_below && ema_f[0] < ema_s[0])) && rsi_ok && vol_ok;
+    // Require both EMA alignment AND price confirmation for better accuracy
+    bool ema_aligned = (ema_f[0] < ema_s[0]);
+    bool strong_signal = crossover || (price_below && ema_aligned && ema_f[0] < ema_f[1]); // EMA falling
+    
+    return strong_signal && rsi_ok && vol_ok;
 }
 
 int CountOpenTrades()
@@ -329,8 +354,9 @@ bool CheckDailyLossLimit()
 //=========================== EXIT LOGIC ============================
 void ManageExits()
 {
-    double atr[1];
+    double atr[];
     ArraySetAsSeries(atr, true);
+    ArrayResize(atr, 1);
     if(CopyBuffer(h_atr, 0, 0, 1, atr) < 1) return;
     
     for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -355,7 +381,8 @@ void ManageExits()
         // Time-based exit
         if(InpMaxTradeLifeMin > 0)
         {
-            int minutes_open = (int)((TimeCurrent() - open_time) / 60);
+            long time_diff = (long)(TimeCurrent() - open_time);
+            int minutes_open = (int)(time_diff / 60);
             if(minutes_open >= InpMaxTradeLifeMin)
             {
                 g_trade.PositionClose(ticket);
@@ -434,13 +461,14 @@ void ManageExits()
 }
 
 //=========================== TRADE EXECUTION =======================
-void TryEnterLong()
+bool TryEnterLong()
 {
-    if(CountOpenTrades() >= InpMaxOpenTrades) return;
+    if(CountOpenTrades() >= InpMaxOpenTrades) return false;
     
-    double atr[1];
+    double atr[];
     ArraySetAsSeries(atr, true);
-    if(CopyBuffer(h_atr, 0, 0, 1, atr) < 1) return;
+    ArrayResize(atr, 1);
+    if(CopyBuffer(h_atr, 0, 0, 1, atr) < 1) return false;
     
     double ask = SymbolInfoDouble(g_active_symbol, SYMBOL_ASK);
     double point = SymbolInfoDouble(g_active_symbol, SYMBOL_POINT);
@@ -456,7 +484,7 @@ void TryEnterLong()
     if(MathAbs(tp - ask) < min_stop) tp = ask + min_stop + point;
     
     double lots = CalculateLotSize(sl_distance / point);
-    if(lots <= 0) return;
+    if(lots <= 0) return false;
     
     g_trade.SetExpertMagicNumber(InpMagicNumber);
     g_trade.SetDeviationInPoints((int)PipsToPoints(InpMaxSlippage));
@@ -466,20 +494,23 @@ void TryEnterLong()
     {
         Print("LONG entry: ", lots, " lots @ ", ask, " SL=", sl, " TP=", tp);
         LogTrade("LONG", ask, sl, tp, lots, "EMA crossover + RSI");
+        return true;
     }
     else
     {
         Print("LONG entry failed: ", g_trade.ResultRetcode());
+        return false;
     }
 }
 
-void TryEnterShort()
+bool TryEnterShort()
 {
-    if(CountOpenTrades() >= InpMaxOpenTrades) return;
+    if(CountOpenTrades() >= InpMaxOpenTrades) return false;
     
-    double atr[1];
+    double atr[];
     ArraySetAsSeries(atr, true);
-    if(CopyBuffer(h_atr, 0, 0, 1, atr) < 1) return;
+    ArrayResize(atr, 1);
+    if(CopyBuffer(h_atr, 0, 0, 1, atr) < 1) return false;
     
     double bid = SymbolInfoDouble(g_active_symbol, SYMBOL_BID);
     double point = SymbolInfoDouble(g_active_symbol, SYMBOL_POINT);
@@ -495,7 +526,7 @@ void TryEnterShort()
     if(MathAbs(bid - tp) < min_stop) tp = bid - min_stop - point;
     
     double lots = CalculateLotSize(sl_distance / point);
-    if(lots <= 0) return;
+    if(lots <= 0) return false;
     
     g_trade.SetExpertMagicNumber(InpMagicNumber);
     g_trade.SetDeviationInPoints((int)PipsToPoints(InpMaxSlippage));
@@ -505,10 +536,12 @@ void TryEnterShort()
     {
         Print("SHORT entry: ", lots, " lots @ ", bid, " SL=", sl, " TP=", tp);
         LogTrade("SHORT", bid, sl, tp, lots, "EMA crossover + RSI");
+        return true;
     }
     else
     {
         Print("SHORT entry failed: ", g_trade.ResultRetcode());
+        return false;
     }
 }
 
@@ -518,6 +551,7 @@ void OnTick()
     // Process only on new bar
     datetime current_bar[];
     ArraySetAsSeries(current_bar, true);
+    ArrayResize(current_bar, 1);
     if(CopyTime(g_active_symbol, InpTimeframe, 0, 1, current_bar) <= 0) return;
     
     if(current_bar[0] == g_last_bar_time) 
@@ -549,14 +583,42 @@ void OnTick()
     // Manage existing positions
     ManageExits();
     
-    // Check for new entries
-    if(CheckLongEntry())
+    // Check for new entries with signal confirmation
+    bool long_signal = CheckLongEntry();
+    bool short_signal = CheckShortEntry();
+    
+    // Track consecutive signal bars
+    if(long_signal)
     {
-        TryEnterLong();
+        g_long_signal_count++;
+        g_short_signal_count = 0; // Reset opposite signal
     }
-    else if(CheckShortEntry())
+    else if(short_signal)
     {
-        TryEnterShort();
+        g_short_signal_count++;
+        g_long_signal_count = 0; // Reset opposite signal
+    }
+    else
+    {
+        // No signal - reset both counters
+        g_long_signal_count = 0;
+        g_short_signal_count = 0;
+    }
+    
+    // Enter only after confirmation across N bars
+    if(g_long_signal_count >= InpSignalConfirmation && long_signal)
+    {
+        if(TryEnterLong())
+        {
+            g_long_signal_count = 0; // Reset after entry
+        }
+    }
+    else if(g_short_signal_count >= InpSignalConfirmation && short_signal)
+    {
+        if(TryEnterShort())
+        {
+            g_short_signal_count = 0; // Reset after entry
+        }
     }
 }
 
@@ -579,10 +641,13 @@ int OnInit()
     }
     
     Print("========================================");
-    Print("EURUSDm Robot Initialized");
+    Print("EURUSDm Robot Initialized - M1 Optimized");
     Print("Symbol: ", g_active_symbol);
     Print("Timeframe: ", EnumToString(InpTimeframe));
     Print("Magic Number: ", InpMagicNumber);
+    Print("Signal Confirmation: ", InpSignalConfirmation, " bars");
+    Print("Risk per Trade: ", InpRiskPercent, "%");
+    Print("Max Spread: ", InpMaxSpread, " pips");
     Print("========================================");
     
     // Initialize indicators
