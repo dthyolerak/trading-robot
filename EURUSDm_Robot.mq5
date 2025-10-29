@@ -32,6 +32,16 @@ input double   InpADX_MinLevel     = 20.0;          // Minimum ADX for trade (tr
 input bool     InpVolumeConfirm    = true;           // Require volume/volatility confirmation
 input int      InpVolumeLookback   = 5;              // Bars to check for volume confirmation
 
+input group "=== MARKET REGIME & ADAPTIVE BEHAVIOR ===";
+input bool     InpRegimeDetection  = true;          // Detect trending vs ranging markets
+input double   InpRegimeADX_Threshold = 25.0;       // ADX threshold for trending (above=ranging)
+input double   InpRegimeBB_WidthMult = 1.2;          // BB width multiplier for ranging detection
+input bool     InpATR_SlopeDetection = true;        // Use ATR slope for volatility expansion
+input double   InpATR_SlopeThreshold = 1.15;         // ATR expansion threshold (15% increase)
+input bool     InpAdaptiveParameters = false;        // Auto-optimize EMA/RSI weekly
+input int      InpAdaptiveMinTrades = 20;            // Min trades before adaptation
+input bool     InpUsePatternClassifier = true;       // Use candle pattern classifier filter
+
 input group "=== ATR-BASED EXIT RULES ===";
 input int      InpATR_Period       = 14;            // ATR period
 input double   InpSL_Multiplier    = 1.5;           // SL = ATR * multiplier (smaller for M1)
@@ -101,6 +111,18 @@ input bool     InpAllowWeekend     = false;         // Allow trading on weekends
 input bool     InpLogToCSV         = true;          // Export trades to CSV
 input string   InpLogDirectory     = "EURUSDm_Robot"; // Log directory name
 
+// === TESTING, REPORTING & MONITORING ===
+input bool     InpShowChartLabels  = true;          // Draw labels for entries/exits on chart
+input bool     InpExportDailySummary = true;        // Export daily performance summary
+input bool     InpExportWeeklySummary = true;       // Export weekly performance summary
+input string   InpReportDirectory  = "reports";     // Directory for summaries (Common Files)
+input bool     InpAlertsEnabled    = true;          // Enable terminal alerts
+input bool     InpTelegramEnabled  = false;         // Enable Telegram alerts (requires WebRequest permission)
+input string   InpTelegramBotToken = "";           // Telegram bot token
+input string   InpTelegramChatId   = "";           // Telegram chat ID
+input bool     InpEmailEnabled     = false;         // Enable email alerts (set email in terminal options)
+input string   InpEmailTo          = "";            // Email recipient
+
 //=========================== GLOBALS ===============================
 CTrade         g_trade;
 CPositionInfo  g_pos;
@@ -135,6 +157,29 @@ int            g_short_signal_count = 0;
 
 // Standby mode (after reversal close)
 datetime       g_standby_until = 0;
+
+// Market regime tracking
+enum MarketRegime
+{
+    REGIME_UNKNOWN,
+    REGIME_TRENDING,
+    REGIME_RANGING
+};
+MarketRegime   g_current_regime = REGIME_UNKNOWN;
+datetime       g_regime_last_check = 0;
+
+// Adaptive parameters (updated weekly)
+struct AdaptiveParams
+{
+    int ema_fast;
+    int ema_slow;
+    int rsi_period;
+    double rsi_long_min;
+    double rsi_short_max;
+    datetime last_update;
+    int trades_count;
+};
+AdaptiveParams g_adaptive_params;
 
 // Partial TP and dynamic TP tracking (ticket -> state)
 struct TradeState
@@ -213,7 +258,9 @@ bool CheckEquityDrawdown()
         
         if(drawdown_pct >= InpEquityDrawdownLimit)
         {
-            Print("STOP: Equity drawdown limit reached: ", drawdown_pct, "% (limit: ", InpEquityDrawdownLimit, "%)");
+            string msg = "Equity drawdown limit reached: " + DoubleToString(drawdown_pct,2) + "% (limit: " + DoubleToString(InpEquityDrawdownLimit,2) + "%)";
+            Print("STOP: ", msg);
+            SendAlert(msg);
             return false; // Stop trading
         }
     }
@@ -296,7 +343,7 @@ void InitializeLogging()
 
 void LogTrade(string type, double entry, double sl, double tp, double lots, string reason)
 {
-    if(!InpLogToCSV) return;
+    if(!InpLogToCSV && !InpShowChartLabels && !InpAlertsEnabled) return;
     
     double ema_f[], ema_s[], rsi[], atr[];
     ArraySetAsSeries(ema_f, true);
@@ -330,6 +377,28 @@ void LogTrade(string type, double entry, double sl, double tp, double lots, stri
             rr_ratio = reward_points / risk_points;
     }
     
+    // Chart labels for entries/exits
+    if(InpShowChartLabels)
+    {
+        color c = clrGray;
+        if(StringFind(type, "LONG") == 0 || StringFind(type, "ENTRY_BUY") == 0) c = clrLime;
+        if(StringFind(type, "SHORT") == 0 || StringFind(type, "ENTRY_SELL") == 0) c = clrRed;
+        if(StringFind(type, "EXIT") >= 0) c = clrGold;
+        string label = type + ": " + reason;
+        PlotLabel(type, entry, label, c);
+    }
+    
+    // Alerts for key events
+    if(InpAlertsEnabled)
+    {
+        if(StringFind(type, "REVERSAL_EXIT") >= 0)
+        {
+            SendAlert("Reversal exit: " + reason + " @ " + DoubleToString(entry, _Digits));
+        }
+    }
+    
+    if(!InpLogToCSV) return;
+    
     int h = FileOpen(g_log_file, FILE_READ|FILE_WRITE|FILE_CSV|FILE_COMMON, ';');
     if(h != INVALID_HANDLE)
     {
@@ -343,7 +412,6 @@ void LogTrade(string type, double entry, double sl, double tp, double lots, stri
                   risk_points, reward_points, rr_ratio);
         FileClose(h);
         
-        // Also print R:R ratio to terminal for quick reference
         if(rr_ratio > 0)
             Print("Trade R:R Ratio: ", DoubleToString(rr_ratio, 2), " (Risk: ", 
                   DoubleToString(risk_points, 1), " pts, Reward: ", DoubleToString(reward_points, 1), " pts)");
@@ -353,8 +421,12 @@ void LogTrade(string type, double entry, double sl, double tp, double lots, stri
 //=========================== INDICATORS ============================
 bool CreateIndicators()
 {
-    h_ema_fast = iMA(g_active_symbol, InpTimeframe, InpEMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
-    h_ema_slow = iMA(g_active_symbol, InpTimeframe, InpEMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+    // Use adaptive EMA periods if adaptive optimization is enabled
+    int ema_fast_period = GetAdaptiveEMA_Fast();
+    int ema_slow_period = GetAdaptiveEMA_Slow();
+    
+    h_ema_fast = iMA(g_active_symbol, InpTimeframe, ema_fast_period, 0, MODE_EMA, PRICE_CLOSE);
+    h_ema_slow = iMA(g_active_symbol, InpTimeframe, ema_slow_period, 0, MODE_EMA, PRICE_CLOSE);
     h_rsi      = iRSI(g_active_symbol, InpTimeframe, InpRSI_Period, PRICE_CLOSE);
     h_atr      = iATR(g_active_symbol, InpTimeframe, InpATR_Period);
     h_macd     = iMACD(g_active_symbol, InpTimeframe, 12, 26, 9, PRICE_CLOSE);
@@ -768,6 +840,310 @@ double CalculateLotSize(double sl_distance_points)
     return lots;
 }
 
+//=========================== MARKET REGIME DETECTION ===============
+MarketRegime DetectMarketRegime()
+{
+    if(!InpRegimeDetection) return REGIME_TRENDING; // Default to trending
+    
+    // Check ADX for trend strength
+    double adx[];
+    ArraySetAsSeries(adx, true);
+    ArrayResize(adx, 1);
+    bool adx_available = false;
+    if(h_adx != INVALID_HANDLE && CopyBuffer(h_adx, 0, 0, 1, adx) >= 1)
+        adx_available = true;
+    
+    // Check Bollinger Band width (contraction = ranging)
+    double bb_upper[], bb_lower[], bb_middle[];
+    ArraySetAsSeries(bb_upper, true);
+    ArraySetAsSeries(bb_lower, true);
+    ArraySetAsSeries(bb_middle, true);
+    ArrayResize(bb_upper, 20);
+    ArrayResize(bb_lower, 20);
+    ArrayResize(bb_middle, 20);
+    bool bb_available = false;
+    if(h_bb != INVALID_HANDLE && CopyBuffer(h_bb, 1, 0, 20, bb_upper) >= 20 &&
+       CopyBuffer(h_bb, 2, 0, 20, bb_lower) >= 20)
+    {
+        bb_available = true;
+    }
+    
+    // Calculate average BB width
+    double bb_width_avg = 0.0;
+    if(bb_available)
+    {
+        double width_sum = 0.0;
+        for(int i = 0; i < 20; i++)
+        {
+            double width = (bb_upper[i] - bb_lower[i]) / bb_middle[i]; // Normalized width
+            width_sum += width;
+        }
+        bb_width_avg = width_sum / 20.0;
+    }
+    
+    // Current BB width
+    double bb_width_current = 0.0;
+    if(bb_available)
+    {
+        double upper_curr[], lower_curr[], middle_curr[];
+        ArraySetAsSeries(upper_curr, true);
+        ArraySetAsSeries(lower_curr, true);
+        ArraySetAsSeries(middle_curr, true);
+        ArrayResize(upper_curr, 1);
+        ArrayResize(lower_curr, 1);
+        ArrayResize(middle_curr, 1);
+        if(CopyBuffer(h_bb, 1, 0, 1, upper_curr) >= 1 &&
+           CopyBuffer(h_bb, 2, 0, 1, lower_curr) >= 1 &&
+           CopyBuffer(h_bb, 0, 0, 1, middle_curr) >= 1)
+        {
+            if(middle_curr[0] > 0)
+                bb_width_current = (upper_curr[0] - lower_curr[0]) / middle_curr[0];
+        }
+    }
+    
+    // Decision logic: ADX + BB width
+    bool is_trending = false;
+    
+    if(adx_available && adx[0] >= InpRegimeADX_Threshold)
+        is_trending = true;
+    else if(adx_available && adx[0] < InpRegimeADX_Threshold)
+        is_trending = false;
+    
+    // BB width check: if current width is much smaller than average = ranging
+    if(bb_available && bb_width_avg > 0 && bb_width_current > 0)
+    {
+        if(bb_width_current < bb_width_avg * (1.0 / InpRegimeBB_WidthMult))
+            is_trending = false; // Narrow BB = ranging
+    }
+    
+    return (is_trending) ? REGIME_TRENDING : REGIME_RANGING;
+}
+
+//=========================== ATR SLOPE & VOLATILITY ===============
+bool CheckATRExpansion()
+{
+    if(!InpATR_SlopeDetection) return true; // Don't filter if disabled
+    
+    double atr[];
+    ArraySetAsSeries(atr, true);
+    ArrayResize(atr, 10);
+    if(CopyBuffer(h_atr, 0, 0, 10, atr) < 10) return true;
+    
+    // Calculate average ATR over last 10 bars
+    double atr_sum = 0.0;
+    for(int i = 1; i < 10; i++) // Skip current bar
+        atr_sum += atr[i];
+    double atr_avg = atr_sum / 9.0;
+    
+    // Current ATR vs average
+    if(atr_avg > 0 && atr[0] >= atr_avg * InpATR_SlopeThreshold)
+        return true; // Expanding volatility = good for breakouts
+    
+    return false; // Contracting volatility = wait
+}
+
+double GetATRSlope()
+{
+    double atr[];
+    ArraySetAsSeries(atr, true);
+    ArrayResize(atr, 5);
+    if(CopyBuffer(h_atr, 0, 0, 5, atr) < 5) return 0.0;
+    
+    // Simple linear regression slope
+    double sum_x = 0.0, sum_y = 0.0, sum_xy = 0.0, sum_x2 = 0.0;
+    for(int i = 0; i < 5; i++)
+    {
+        double x = (double)i;
+        double y = atr[i];
+        sum_x += x;
+        sum_y += y;
+        sum_xy += x * y;
+        sum_x2 += x * x;
+    }
+    
+    double n = 5.0;
+    double slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x);
+    return slope;
+}
+
+//=========================== CANDLE PATTERN CLASSIFIER ============
+double ClassifyCandlePattern(bool for_long)
+{
+    if(!InpUsePatternClassifier) return 0.5; // Neutral if disabled
+    
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    if(CopyRates(g_active_symbol, InpTimeframe, 0, 5, rates) < 5) return 0.5;
+    
+    double score = 0.5; // Neutral baseline
+    
+    // Pattern 1: Engulfing patterns
+    double body_now = MathAbs(rates[0].close - rates[0].open);
+    double body_prev = MathAbs(rates[1].close - rates[1].open);
+    double wick_upper = rates[0].high - MathMax(rates[0].open, rates[0].close);
+    double wick_lower = MathMin(rates[0].open, rates[0].close) - rates[0].low;
+    
+    if(for_long)
+    {
+        // Bullish patterns
+        bool bullish_engulf = (body_now > body_prev * 1.2) &&
+                             (rates[0].close > rates[0].open) &&
+                             (rates[1].close < rates[1].open) &&
+                             (rates[0].open < rates[1].close) &&
+                             (rates[0].close > rates[1].open);
+        if(bullish_engulf) score += 0.20;
+        
+        // Hammer pattern
+        bool hammer = (wick_lower > body_now * 2.0) &&
+                     (wick_upper < body_now * 0.5) &&
+                     (rates[0].close > rates[0].open);
+        if(hammer) score += 0.15;
+        
+        // Long green candle
+        if(rates[0].close > rates[0].open && body_now > body_prev * 1.5)
+            score += 0.10;
+    }
+    else
+    {
+        // Bearish patterns
+        bool bearish_engulf = (body_now > body_prev * 1.2) &&
+                             (rates[0].close < rates[0].open) &&
+                             (rates[1].close > rates[1].open) &&
+                             (rates[0].open > rates[1].close) &&
+                             (rates[0].close < rates[1].open);
+        if(bearish_engulf) score += 0.20;
+        
+        // Shooting star pattern
+        bool shooting_star = (wick_upper > body_now * 2.0) &&
+                            (wick_lower < body_now * 0.5) &&
+                            (rates[0].close < rates[0].open);
+        if(shooting_star) score += 0.15;
+        
+        // Long red candle
+        if(rates[0].close < rates[0].open && body_now > body_prev * 1.5)
+            score += 0.10;
+    }
+    
+    // Pattern 2: Doji (indecision - negative)
+    double range = rates[0].high - rates[0].low;
+    if(range > 0 && body_now / range < 0.1)
+        score -= 0.10; // Reduce confidence
+    
+    // Pattern 3: Consecutive same-direction candles
+    if(for_long)
+    {
+        int green_count = 0;
+        for(int i = 0; i < 3; i++)
+        {
+            if(rates[i].close > rates[i].open) green_count++;
+        }
+        if(green_count >= 2) score += 0.08;
+    }
+    else
+    {
+        int red_count = 0;
+        for(int i = 0; i < 3; i++)
+        {
+            if(rates[i].close < rates[i].open) red_count++;
+        }
+        if(red_count >= 2) score += 0.08;
+    }
+    
+    return MathMin(1.0, MathMax(0.0, score)); // Clamp to 0-1
+}
+
+//=========================== ADAPTIVE PARAMETER OPTIMIZATION ======
+void InitializeAdaptiveParams()
+{
+    g_adaptive_params.ema_fast = InpEMA_Fast;
+    g_adaptive_params.ema_slow = InpEMA_Slow;
+    g_adaptive_params.rsi_period = InpRSI_Period;
+    g_adaptive_params.rsi_long_min = InpRSI_LongMin;
+    g_adaptive_params.rsi_short_max = InpRSI_ShortMax;
+    g_adaptive_params.last_update = TimeCurrent();
+    g_adaptive_params.trades_count = 0;
+}
+
+void OptimizeAdaptiveParameters()
+{
+    if(!InpAdaptiveParameters) return;
+    
+    // Only optimize weekly
+    datetime now = TimeCurrent();
+    MqlDateTime dt_now, dt_last;
+    TimeToStruct(now, dt_now);
+    TimeToStruct(g_adaptive_params.last_update, dt_last);
+    
+    // Check if a week has passed and we have enough trades
+    int days_diff = (int)((now - g_adaptive_params.last_update) / 86400);
+    if(days_diff < 7) return; // Not a week yet
+    
+    if(g_adaptive_params.trades_count < InpAdaptiveMinTrades) return;
+    
+    // Analyze performance for different parameter ranges
+    // This is a simplified optimization - real version would backtest
+    // For now, adjust based on win rate
+    
+    HistorySelect(g_adaptive_params.last_update, now);
+    int deals = HistoryDealsTotal();
+    int wins = 0;
+    double total_profit = 0.0;
+    
+    for(int i = 0; i < deals; i++)
+    {
+        ulong ticket = HistoryDealGetTicket(i);
+        if((string)HistoryDealGetString(ticket, DEAL_SYMBOL) != g_active_symbol) continue;
+        if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+        
+        double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+        total_profit += profit;
+        if(profit > 0) wins++;
+    }
+    
+    double win_rate = (deals > 0) ? ((double)wins / deals) * 100.0 : 0.0;
+    
+    // Simple adaptive logic: adjust parameters based on performance
+    // If win rate < 50%, tighten filters (more restrictive)
+    // If win rate > 60%, can relax filters (but be conservative)
+    
+    if(win_rate < 50.0 && deals >= InpAdaptiveMinTrades)
+    {
+        // Tighten: Increase EMA periods slightly, adjust RSI
+        g_adaptive_params.ema_fast = MathMax(10, MathMin(20, g_adaptive_params.ema_fast + 1));
+        g_adaptive_params.ema_slow = MathMax(24, MathMin(35, g_adaptive_params.ema_slow + 1));
+        g_adaptive_params.rsi_long_min = MathMin(55.0, g_adaptive_params.rsi_long_min + 1.0);
+        g_adaptive_params.rsi_short_max = MathMax(45.0, g_adaptive_params.rsi_short_max - 1.0);
+        
+        Print("Adaptive: Tightened parameters (win rate: ", DoubleToString(win_rate, 1), "%)");
+    }
+    else if(win_rate > 60.0 && total_profit > 0 && deals >= InpAdaptiveMinTrades)
+    {
+        // Slightly relax if performing very well (but conservatively)
+        g_adaptive_params.ema_fast = MathMax(10, MathMin(20, g_adaptive_params.ema_fast - 1));
+        g_adaptive_params.ema_slow = MathMax(24, MathMin(35, g_adaptive_params.ema_slow - 1));
+        
+        Print("Adaptive: Relaxed parameters slightly (win rate: ", DoubleToString(win_rate, 1), "%)");
+    }
+    
+    // Reset counters
+    g_adaptive_params.last_update = now;
+    g_adaptive_params.trades_count = 0;
+}
+
+int GetAdaptiveEMA_Fast()
+{
+    if(InpAdaptiveParameters && g_adaptive_params.ema_fast > 0)
+        return g_adaptive_params.ema_fast;
+    return InpEMA_Fast;
+}
+
+int GetAdaptiveEMA_Slow()
+{
+    if(InpAdaptiveParameters && g_adaptive_params.ema_slow > 0)
+        return g_adaptive_params.ema_slow;
+    return InpEMA_Slow;
+}
+
 //=========================== FILTER FUNCTIONS =======================
 void GetAdaptiveRSIThresholds(double &long_min, double &short_max)
 {
@@ -977,11 +1353,35 @@ bool CheckLongEntry()
     if(InpMTF_EntryConfirm || InpBiasUseHigherTF)
         higher_tf_ok = CheckHigherTFTrend(true);
     
-    // Require both EMA alignment AND price confirmation for better accuracy
-    bool ema_aligned = (ema_f[0] > ema_s[0]);
-    bool strong_signal = crossover || (price_above && ema_aligned && ema_f[0] > ema_f[1]); // EMA rising
+    // MARKET REGIME DETECTION: Switch strategy based on market type
+    MarketRegime regime = DetectMarketRegime();
+    bool regime_ok = true;
+    bool strong_signal = false;
     
-    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok && higher_tf_ok;
+    if(regime == REGIME_TRENDING)
+    {
+        // TRENDING: Use EMA crossover strategy (momentum following)
+        bool ema_aligned = (ema_f[0] > ema_s[0]);
+        strong_signal = crossover || (price_above && ema_aligned && ema_f[0] > ema_f[1]); // EMA rising
+    }
+    else // REGIME_RANGING
+    {
+        // RANGING: Use RSI mean reversion strategy
+        // Buy when oversold and turning up
+        bool rsi_oversold = (rsi[0] < 35 && rsi[0] > 25);
+        bool price_near_low = (close_price < ema_s[0]); // Price below slow EMA (oversold area)
+        strong_signal = rsi_oversold && price_near_low;
+    }
+    
+    // ATR expansion check (for breakout entries)
+    bool atr_expansion = CheckATRExpansion();
+    
+    // Candle pattern classifier (ML-like filter)
+    double pattern_score = ClassifyCandlePattern(true); // For long
+    bool pattern_ok = (pattern_score >= 0.5); // Require at least neutral/bullish
+    
+    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok && higher_tf_ok && 
+           regime_ok && atr_expansion && pattern_ok;
 }
 
 bool CheckShortEntry()
@@ -1035,11 +1435,35 @@ bool CheckShortEntry()
     if(InpMTF_EntryConfirm || InpBiasUseHigherTF)
         higher_tf_ok = CheckHigherTFTrend(false);
     
-    // Require both EMA alignment AND price confirmation for better accuracy
-    bool ema_aligned = (ema_f[0] < ema_s[0]);
-    bool strong_signal = crossover || (price_below && ema_aligned && ema_f[0] < ema_f[1]); // EMA falling
+    // MARKET REGIME DETECTION: Switch strategy based on market type
+    MarketRegime regime = DetectMarketRegime();
+    bool regime_ok = true;
+    bool strong_signal = false;
     
-    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok && higher_tf_ok;
+    if(regime == REGIME_TRENDING)
+    {
+        // TRENDING: Use EMA crossover strategy (momentum following)
+        bool ema_aligned = (ema_f[0] < ema_s[0]);
+        strong_signal = crossover || (price_below && ema_aligned && ema_f[0] < ema_f[1]); // EMA falling
+    }
+    else // REGIME_RANGING
+    {
+        // RANGING: Use RSI mean reversion strategy
+        // Sell when overbought and turning down
+        bool rsi_overbought = (rsi[0] > 65 && rsi[0] < 75);
+        bool price_near_high = (close_price > ema_s[0]); // Price above slow EMA (overbought area)
+        strong_signal = rsi_overbought && price_near_high;
+    }
+    
+    // ATR expansion check (for breakout entries)
+    bool atr_expansion = CheckATRExpansion();
+    
+    // Candle pattern classifier (ML-like filter)
+    double pattern_score = ClassifyCandlePattern(false); // For short
+    bool pattern_ok = (pattern_score <= 0.5); // Require at least neutral/bearish
+    
+    return strong_signal && rsi_ok && vol_ok && adx_ok && volume_ok && higher_tf_ok &&
+           regime_ok && atr_expansion && pattern_ok;
 }
 
 int CountOpenTrades()
@@ -1814,6 +2238,9 @@ bool TryEnterLong()
     {
         Print("LONG entry: ", lots, " lots @ ", ask, " SL=", sl, " TP=", tp);
         LogTrade("LONG", ask, sl, tp, lots, "EMA crossover + RSI");
+        // Track trade for adaptive optimization
+        if(InpAdaptiveParameters)
+            g_adaptive_params.trades_count++;
         // Best-effort trade state association (optional)
         Sleep(100);
         for(int i=PositionsTotal()-1;i>=0;i--){ if(g_pos.SelectByIndex(i) && g_pos.Symbol()==g_active_symbol && g_pos.Magic()==InpMagicNumber) { AddTradeState(g_pos.Ticket()); break; } }
@@ -1870,6 +2297,9 @@ bool TryEnterShort()
     {
         Print("SHORT entry: ", lots, " lots @ ", bid, " SL=", sl, " TP=", tp);
         LogTrade("SHORT", bid, sl, tp, lots, "EMA crossover + RSI");
+        // Track trade for adaptive optimization
+        if(InpAdaptiveParameters)
+            g_adaptive_params.trades_count++;
         Sleep(100);
         for(int i=PositionsTotal()-1;i>=0;i--){ if(g_pos.SelectByIndex(i) && g_pos.Symbol()==g_active_symbol && g_pos.Magic()==InpMagicNumber) { AddTradeState(g_pos.Ticket()); break; } }
         if(InpAllowScaleIn) TryScaleIn(POSITION_TYPE_SELL);
@@ -1923,6 +2353,15 @@ void OnTick()
         MqlDateTime dt;
         TimeToStruct(TimeCurrent(), dt);
         if(dt.day_of_week == 0 || dt.day_of_week == 6) return;
+    }
+    
+    // Market regime detection (check on new bar)
+    MarketRegime new_regime = DetectMarketRegime();
+    if(new_regime != g_current_regime)
+    {
+        string regime_str = (new_regime == REGIME_TRENDING) ? "TRENDING" : "RANGING";
+        Print("Market regime changed to: ", regime_str);
+        g_current_regime = new_regime;
     }
     
     // Manage existing positions
@@ -2005,6 +2444,13 @@ int OnInit()
     g_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
     g_daily_balance_start = g_start_balance;
     
+    // Initialize adaptive parameters
+    InitializeAdaptiveParams();
+    
+    // Initialize market regime
+    g_current_regime = REGIME_UNKNOWN;
+    g_regime_last_check = 0;
+    
     Print("========================================");
     Print("EURUSDm Robot Initialized - M1 Optimized");
     Print("Symbol: ", g_active_symbol);
@@ -2043,19 +2489,7 @@ void OnDeinit(const int reason)
     Print("EURUSDm Robot deinitialized. Reason: ", reason);
 }
 
-void OnTimer() // Called periodically - update daily balance reset
-{
-    static int last_day = -1;
-    MqlDateTime dt;
-    TimeToStruct(TimeCurrent(), dt);
-    
-    if(last_day != dt.day)
-    {
-        g_daily_balance_start = AccountInfoDouble(ACCOUNT_BALANCE);
-        last_day = dt.day;
-        Print("Daily balance reset. New starting balance: ", g_daily_balance_start);
-    }
-}
+// Old OnTimer removed - using the merged version below
 
 //=========================== ORDER EXECUTION ========================
 bool PlaceOrderWithRetry(ENUM_ORDER_TYPE type, double lots, double price, double sl, double tp, string comment)
@@ -2165,4 +2599,147 @@ bool TryScaleIn(ENUM_POSITION_TYPE type)
     bool ok = PlaceOrderWithRetry((type==POSITION_TYPE_BUY)? ORDER_TYPE_BUY:ORDER_TYPE_SELL, lots, price, sl, tp, "EURUSDm ScaleIn");
     if(ok) Print("Scale-in executed: ", lots, " @ ", price);
     return ok;
+}
+
+//=========================== CHART & ALERTS =========================
+void PlotLabel(string prefix, double price, string text, color clr)
+{
+    if(!InpShowChartLabels) return;
+    string name = prefix + "_" + TimeToString(TimeCurrent(), TIME_SECONDS) + "_" + IntegerToString(MathRand());
+    ObjectCreate(0, name, OBJ_TEXT, 0, TimeCurrent(), price);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+    ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+bool SendTelegram(string message)
+{
+    if(!InpTelegramEnabled) return false;
+    if(StringLen(InpTelegramBotToken)==0 || StringLen(InpTelegramChatId)==0) return false;
+    string url = "https://api.telegram.org/bot" + InpTelegramBotToken + "/sendMessage";
+    string body = "chat_id=" + InpTelegramChatId + "&text=" + message;
+    char data[]; StringToCharArray(body, data);
+    char result[]; string headers;
+    int code = WebRequest("POST", url, headers, 5000, data, ArraySize(data), result, headers);
+    if(code==200) return true;
+    Print("Telegram send failed, code=", code);
+    return false;
+}
+
+void SendAlert(string message)
+{
+    if(InpAlertsEnabled)
+    {
+        Alert(message);
+        Print("ALERT: ", message);
+    }
+    if(InpTelegramEnabled) SendTelegram(message);
+    if(InpEmailEnabled && StringLen(InpEmailTo)>0) SendMail("EA Alert", message);
+}
+
+void ExportPerformanceSummary(string period)
+{
+    if(!(InpExportDailySummary || InpExportWeeklySummary)) return;
+    datetime from_time=0, to_time=TimeCurrent();
+    MqlDateTime dt; TimeToStruct(to_time, dt);
+    if(period=="daily")
+    {
+        if(!InpExportDailySummary) return;
+        dt.hour = 0; dt.min = 0; dt.sec = 0;
+        from_time = StructToTime(dt);
+    }
+    else if(period=="weekly")
+    {
+        if(!InpExportWeeklySummary) return;
+        // Set to Monday 00:00 of current week (ISO: Monday=1)
+        int dow = dt.day_of_week; if(dow==0) dow = 7; // Sunday -> 7
+        datetime monday = to_time - (dow-1)*24*60*60; MqlDateTime md; TimeToStruct(monday, md); md.hour=0; md.min=0; md.sec=0; from_time=StructToTime(md);
+    }
+    else return;
+    
+    HistorySelect(from_time, to_time);
+    int deals = HistoryDealsTotal();
+    int wins=0, losses=0; double gross_profit=0, gross_loss=0; int trades=0;
+    for(int i=0;i<deals;i++)
+    {
+        ulong ticket = HistoryDealGetTicket(i);
+        if((string)HistoryDealGetString(ticket, DEAL_SYMBOL) != g_active_symbol) continue;
+        long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+        if(entry != DEAL_ENTRY_OUT) continue; // only exits
+        double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+        trades++;
+        if(profit>=0){ wins++; gross_profit += profit; } else { losses++; gross_loss += MathAbs(profit); }
+    }
+    double win_rate = (trades>0)? (100.0 * wins / trades) : 0.0;
+    double avg_win = (wins>0)? (gross_profit/wins) : 0.0;
+    double avg_loss = (losses>0)? (gross_loss/losses) : 0.0;
+    double profit_factor = (gross_loss>0)? (gross_profit/gross_loss) : (gross_profit>0? 999.0:0.0);
+    
+    string fname = InpReportDirectory + "/summary_" + period + "_" + TimeToString(TimeCurrent(), TIME_DATE) + ".csv";
+    int h = FileOpen(fname, FILE_READ|FILE_WRITE|FILE_CSV|FILE_COMMON, ';');
+    if(h!=INVALID_HANDLE)
+    {
+        if(FileSize(h)==0)
+            FileWrite(h, "Time","Period","Trades","Wins","Losses","WinRate%","AvgWin","AvgLoss","ProfitFactor","GrossProfit","GrossLoss");
+        FileSeek(h, 0, SEEK_END);
+        FileWrite(h, TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES), period, trades, wins, losses,
+                  DoubleToString(win_rate,2), DoubleToString(avg_win,2), DoubleToString(avg_loss,2), DoubleToString(profit_factor,2),
+                  DoubleToString(gross_profit,2), DoubleToString(gross_loss,2));
+        FileClose(h);
+        Print("Exported ", period, " performance summary to ", fname);
+    }
+}
+
+void OnTimer()
+{
+    static int last_day = -1;
+    static int last_week = -1;
+    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+    
+    // Daily rollover
+    if(last_day != dt.day)
+    {
+        last_day = dt.day;
+        g_daily_balance_start = AccountInfoDouble(ACCOUNT_BALANCE);
+        Print("Daily balance reset. New starting balance: ", g_daily_balance_start);
+        ExportPerformanceSummary("daily");
+    }
+    
+    // Weekly rollover (Monday as start)
+    int week_index = (int)TimeCurrent()/(7*24*60*60);
+    if(last_week != week_index)
+    {
+        last_week = week_index;
+        ExportPerformanceSummary("weekly");
+        
+        // Weekly adaptive parameter optimization
+        OptimizeAdaptiveParameters();
+        
+        // Recreate indicators with new adaptive parameters if changed
+        if(InpAdaptiveParameters)
+        {
+            IndicatorRelease(h_ema_fast);
+            IndicatorRelease(h_ema_slow);
+            h_ema_fast = iMA(g_active_symbol, InpTimeframe, GetAdaptiveEMA_Fast(), 0, MODE_EMA, PRICE_CLOSE);
+            h_ema_slow = iMA(g_active_symbol, InpTimeframe, GetAdaptiveEMA_Slow(), 0, MODE_EMA, PRICE_CLOSE);
+            if(h_ema_fast == INVALID_HANDLE || h_ema_slow == INVALID_HANDLE)
+                Print("ERROR: Failed to recreate adaptive indicators");
+        }
+    }
+    
+    // Market regime detection (check every 5 minutes)
+    static datetime last_regime_check = 0;
+    datetime now = TimeCurrent();
+    if(now - last_regime_check >= 300) // 5 minutes
+    {
+        MarketRegime new_regime = DetectMarketRegime();
+        if(new_regime != g_current_regime)
+        {
+            string regime_str = (new_regime == REGIME_TRENDING) ? "TRENDING" : "RANGING";
+            Print("Market regime changed to: ", regime_str);
+            g_current_regime = new_regime;
+        }
+        last_regime_check = now;
+        g_regime_last_check = now;
+    }
 }
